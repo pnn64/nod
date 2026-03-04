@@ -1,0 +1,14 @@
+[package]
+name = "rnon"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.32", features = ["derive"] }
+md5 = "0.8.0"
+png = "0.18.0"
+rssp = { path = "../deadsync/src/extern/rssp" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+walkdir = "2.5.0"
+zstd = "0.13.3"
