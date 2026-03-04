@@ -4,7 +4,7 @@ Terminal-first Rust reimplementation scaffold for `nine-or-null` parity work.
 
 ## Current status
 
-- `rnon analyze <path>`: scans simfiles, parses chart metadata through `rssp`, emits JSON.
+- `rnon analyze <path>`: scans simfiles, parses chart metadata through `rssp`, and probes OGG audio via `lewton` (Python-compatible mono collapse), then emits JSON.
 - `rnon parity <path> --baseline <dir>`: compares simfile metadata + chart structure against MD5-sharded baseline fixtures.
 - `rnon harness <path> --baseline <dir>`: runs Python `nine-or-null` reference analysis and writes canonical `json.zst` fixtures.
 - `rnon plot <input.json> <out.png>`: draws bias markers from JSON (`bias_ms`, `bias_result`, or `bias`).

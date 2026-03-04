@@ -57,7 +57,20 @@ pub struct SimfileScan {
     pub artist: Option<String>,
     pub offset_seconds: Option<f64>,
     pub music_tag: Option<String>,
+    pub audio: AudioScan,
     pub charts: Vec<ChartScan>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioScan {
+    pub status: String,
+    pub path: Option<String>,
+    pub sample_rate_hz: Option<u32>,
+    pub source_channels: Option<u16>,
+    pub mono_samples: Option<usize>,
+    pub duration_seconds: Option<f64>,
+    pub peak_abs: Option<f32>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

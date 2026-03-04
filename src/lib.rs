@@ -1,4 +1,5 @@
 mod analyze;
+mod audio;
 mod cli;
 mod compat;
 mod fs_scan;
