@@ -77,6 +77,8 @@ pub struct ParityCase {
     pub baseline_rel: Option<String>,
     pub status: String,
     pub error: Option<String>,
+    pub mismatch_count: usize,
+    pub mismatches: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,9 +90,11 @@ pub struct ParityReport {
     pub baseline_path: String,
     pub total_simfiles: usize,
     pub matched: usize,
+    pub mismatched: usize,
     pub missing_baseline: usize,
     pub invalid_baseline: usize,
     pub read_errors: usize,
+    pub analyze_errors: usize,
     pub cases: Vec<ParityCase>,
 }
 

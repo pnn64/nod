@@ -28,6 +28,11 @@ pub fn run() -> Result<(), String> {
                     "missing {} baseline fixture(s)",
                     report.missing_baseline
                 ))
+            } else if args.fail_on_mismatch && report.mismatched > 0 {
+                Err(format!(
+                    "found {} parity mismatch case(s)",
+                    report.mismatched
+                ))
             } else {
                 Ok(())
             }
