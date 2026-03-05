@@ -86,6 +86,7 @@ def chart_rows(args, base_simfile, simfile_dir, nine_or_null, params):
             simfile_dir,
             base_simfile,
             chart_index=chart_index,
+            source_simfile_path=str(args.simfile_path),
             report_path=args.report_dir,
             save_plots=False,
             show_intermediate_plots=False,
@@ -151,8 +152,6 @@ def main():
     os.makedirs(args.report_dir, exist_ok=True)
     add_source_root(args.source_root)
 
-    import matplotlib
-    matplotlib.use("Agg")
     import simfile
     import nine_or_null
 

@@ -1,5 +1,6 @@
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
+use serde::Serialize;
 use std::sync::Arc;
 
 use crate::model::{BiasKernel, KernelTarget};
@@ -9,6 +10,10 @@ const FREQ_EMPHASIS: f64 = 3000.0;
 const NEARNESS_SCALAR: f64 = 10.0;
 const NEARNESS_OFFSET: f64 = 0.5;
 const THEORETICAL_UPPER: f64 = 0.83;
+const FULL_SPEC_MAX_BYTES: usize = 256 * 1024 * 1024;
+const PEAK_STABILIZE_QUINT_MAX: f64 = 0.06;
+const PEAK_STABILIZE_REL_EPS: f64 = 0.002;
+const PEAK_STABILIZE_MAX_SHIFT: usize = 4;
 
 pub struct BiasCfg {
     pub fingerprint_ms: f64,
@@ -27,6 +32,103 @@ pub struct BiasEstimate {
     pub conv_stdev: f64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct BiasTrace {
+    pub setup: BiasTraceSetup,
+    pub skip_counts: BiasTraceSkips,
+    pub loop_stats: BiasTraceLoop,
+    pub beat_head: Vec<BiasTraceBeat>,
+    pub beat_tail: Vec<BiasTraceBeat>,
+    pub convolution: BiasTraceConv,
+    pub result: BiasTraceResult,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct BiasTraceSetup {
+    pub sample_rate_hz: u32,
+    pub samples: usize,
+    pub nperseg: usize,
+    pub nstep: usize,
+    pub noverlap: usize,
+    pub actual_step_sec: f64,
+    pub fp_size: usize,
+    pub n_freq_taps: usize,
+    pub n_time_taps: isize,
+    pub spectrogram_offset: f64,
+    pub min_sep_sec: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct BiasTraceSkips {
+    pub too_early: usize,
+    pub too_late: usize,
+    pub too_soon: usize,
+    pub short_window: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct BiasTraceLoop {
+    pub beats_scanned: usize,
+    pub beats_used: usize,
+    pub first_beat_index: usize,
+    pub last_beat_index: usize,
+    pub first_beat_time_s: f64,
+    pub last_beat_time_s: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct BiasTraceBeat {
+    pub beat_index: usize,
+    pub beat_time_s: f64,
+    pub window_time_idx_raw_start: isize,
+    pub window_time_idx_raw_end: isize,
+    pub window_time_idx_start: usize,
+    pub window_time_idx_end: usize,
+    pub digest_min: f64,
+    pub digest_max: f64,
+    pub digest_mean: f64,
+    pub digest_std: f64,
+    pub digest_peak_idx: usize,
+    pub digest_peak_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BiasTraceConv {
+    pub edge_discard: usize,
+    pub clip_min: f64,
+    pub clip_max: f64,
+    pub clip_mean: f64,
+    pub clip_std: f64,
+    pub top_peaks: Vec<BiasTracePeak>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct BiasTracePeak {
+    pub clip_index: usize,
+    pub full_index: usize,
+    pub time_ms: f64,
+    pub value: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct BiasTraceResult {
+    pub bias_ms: f64,
+    pub confidence: f64,
+    pub conv_quint: f64,
+    pub conv_stdev: f64,
+    pub i_max: usize,
+    pub v_median: f64,
+    pub v_max: f64,
+    pub v20: f64,
+    pub v80: f64,
+    pub total_max_influence: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BiasTraceCfg {
+    pub keep: usize,
+}
+
 #[derive(Clone, Copy)]
 struct Setup {
     nperseg: usize,
@@ -36,6 +138,56 @@ struct Setup {
     n_time_taps: isize,
     actual_step_sec: f64,
     spectrogram_offset: f64,
+}
+
+#[derive(Clone, Copy)]
+struct BeatWindow {
+    beat_index: usize,
+    beat_time_sec: f64,
+    t_s_raw: isize,
+    t_f_raw: isize,
+    t_s: usize,
+    t_f: usize,
+}
+
+#[derive(Clone, Default)]
+struct BeatWindows {
+    windows: Vec<BeatWindow>,
+    skips: BiasTraceSkips,
+    beats_scanned: usize,
+}
+
+#[derive(Clone, Default)]
+struct TraceCollector {
+    keep: usize,
+    beat_head: Vec<BiasTraceBeat>,
+    beat_tail: Vec<BiasTraceBeat>,
+}
+
+enum BiasResult {
+    Estimate(BiasEstimate),
+    WithTrace(BiasEstimate, BiasTrace),
+}
+
+impl BiasResult {
+    fn into_estimate(self) -> BiasEstimate {
+        match self {
+            Self::Estimate(v) | Self::WithTrace(v, _) => v,
+        }
+    }
+
+    fn into_pair(self) -> Result<(BiasEstimate, BiasTrace), String> {
+        match self {
+            Self::WithTrace(v, t) => Ok((v, t)),
+            Self::Estimate(_) => Err("bias trace requested but not produced".to_string()),
+        }
+    }
+}
+
+struct ConvStats {
+    estimate: BiasEstimate,
+    convolution: BiasTraceConv,
+    result: BiasTraceResult,
 }
 
 #[derive(Default)]
@@ -53,6 +205,50 @@ struct SpectrogramKey {
 struct SpectrogramCacheEntry {
     key: SpectrogramKey,
     ctx: SpectrogramCtx,
+}
+
+impl TraceCollector {
+    fn new(cfg: BiasTraceCfg) -> Self {
+        Self {
+            keep: cfg.keep.max(1),
+            beat_head: Vec::new(),
+            beat_tail: Vec::new(),
+        }
+    }
+
+    fn push_beat(&mut self, beat: BiasTraceBeat) {
+        if self.beat_head.len() < self.keep {
+            self.beat_head.push(beat);
+        }
+        self.beat_tail.push(beat);
+        if self.beat_tail.len() > self.keep {
+            self.beat_tail.remove(0);
+        }
+    }
+}
+
+impl BeatWindows {
+    fn loop_stats(&self) -> BiasTraceLoop {
+        let Some(first) = self.windows.first() else {
+            return BiasTraceLoop {
+                beats_scanned: self.beats_scanned,
+                beats_used: 0,
+                first_beat_index: 0,
+                last_beat_index: 0,
+                first_beat_time_s: 0.0,
+                last_beat_time_s: 0.0,
+            };
+        };
+        let last = self.windows.last().unwrap_or(first);
+        BiasTraceLoop {
+            beats_scanned: self.beats_scanned,
+            beats_used: self.windows.len(),
+            first_beat_index: first.beat_index,
+            last_beat_index: last.beat_index,
+            first_beat_time_s: first.beat_time_sec,
+            last_beat_time_s: last.beat_time_sec,
+        }
+    }
 }
 
 impl BiasRuntime {
@@ -93,7 +289,42 @@ pub fn estimate_bias_reuse(
         0.0,
         &chart.timing_segments,
     );
-    estimate_bias_with_timing_setup(audio_mono, sample_rate_hz, &timing, cfg, setup, runtime)
+    estimate_bias_with_timing_setup(
+        audio_mono,
+        sample_rate_hz,
+        &timing,
+        cfg,
+        setup,
+        runtime,
+        None,
+    )
+    .map(BiasResult::into_estimate)
+}
+
+pub fn estimate_bias_reuse_with_trace(
+    audio_mono: &[f32],
+    sample_rate_hz: u32,
+    chart: &rssp::ChartSummary,
+    cfg: &BiasCfg,
+    runtime: &mut BiasRuntime,
+    trace_cfg: BiasTraceCfg,
+) -> Result<(BiasEstimate, BiasTrace), String> {
+    let setup = build_setup(audio_mono.len(), sample_rate_hz, cfg)?;
+    let timing = rssp::timing::timing_data_from_segments(
+        chart.chart_offset_seconds,
+        0.0,
+        &chart.timing_segments,
+    );
+    estimate_bias_with_timing_setup(
+        audio_mono,
+        sample_rate_hz,
+        &timing,
+        cfg,
+        setup,
+        runtime,
+        Some(trace_cfg),
+    )
+    .and_then(BiasResult::into_pair)
 }
 
 #[allow(dead_code)]
@@ -116,7 +347,16 @@ pub fn estimate_bias_with_timing_reuse(
     runtime: &mut BiasRuntime,
 ) -> Result<BiasEstimate, String> {
     let setup = build_setup(audio_mono.len(), sample_rate_hz, cfg)?;
-    estimate_bias_with_timing_setup(audio_mono, sample_rate_hz, timing, cfg, setup, runtime)
+    estimate_bias_with_timing_setup(
+        audio_mono,
+        sample_rate_hz,
+        timing,
+        cfg,
+        setup,
+        runtime,
+        None,
+    )
+    .map(BiasResult::into_estimate)
 }
 
 #[allow(dead_code)]
@@ -144,7 +384,40 @@ where
     F: FnMut(usize) -> f64,
 {
     let setup = build_setup(audio_mono.len(), sample_rate_hz, cfg)?;
-    estimate_bias_with_setup(audio_mono, sample_rate_hz, cfg, setup, runtime, beat_time_fn)
+    estimate_bias_with_setup(
+        audio_mono,
+        sample_rate_hz,
+        cfg,
+        setup,
+        runtime,
+        None,
+        beat_time_fn,
+    )
+    .map(BiasResult::into_estimate)
+}
+
+pub fn estimate_bias_with_beat_fn_trace_reuse<F>(
+    audio_mono: &[f32],
+    sample_rate_hz: u32,
+    cfg: &BiasCfg,
+    runtime: &mut BiasRuntime,
+    trace_cfg: BiasTraceCfg,
+    beat_time_fn: F,
+) -> Result<(BiasEstimate, BiasTrace), String>
+where
+    F: FnMut(usize) -> f64,
+{
+    let setup = build_setup(audio_mono.len(), sample_rate_hz, cfg)?;
+    estimate_bias_with_setup(
+        audio_mono,
+        sample_rate_hz,
+        cfg,
+        setup,
+        runtime,
+        Some(trace_cfg),
+        beat_time_fn,
+    )
+    .and_then(BiasResult::into_pair)
 }
 
 fn estimate_bias_with_timing_setup(
@@ -154,13 +427,15 @@ fn estimate_bias_with_timing_setup(
     cfg: &BiasCfg,
     setup: Setup,
     runtime: &mut BiasRuntime,
-) -> Result<BiasEstimate, String> {
+    trace_cfg: Option<BiasTraceCfg>,
+) -> Result<BiasResult, String> {
     estimate_bias_with_setup(
         audio_mono,
         sample_rate_hz,
         cfg,
         setup,
         runtime,
+        trace_cfg,
         |beat| rssp::timing::get_time_for_beat(timing, beat as f64),
     )
 }
@@ -171,13 +446,15 @@ fn estimate_bias_with_setup<F>(
     cfg: &BiasCfg,
     setup: Setup,
     runtime: &mut BiasRuntime,
+    trace_cfg: Option<BiasTraceCfg>,
     beat_time_fn: F,
-) -> Result<BiasEstimate, String>
+) -> Result<BiasResult, String>
 where
     F: FnMut(usize) -> f64,
 {
-    let windows = beat_windows_from_fn(audio_mono.len(), sample_rate_hz, cfg, setup, beat_time_fn);
-    if windows.is_empty() {
+    let window_stats =
+        beat_windows_from_fn(audio_mono.len(), sample_rate_hz, cfg, setup, beat_time_fn);
+    if window_stats.windows.is_empty() {
         return Err("no beat windows produced for bias calculation".to_string());
     }
     let key = SpectrogramKey {
@@ -186,7 +463,18 @@ where
         nstep: setup.nstep,
     };
     let sp = runtime.spectrogram_ctx(key);
-    let (acc, digest, beats) = build_fingerprints(audio_mono, sample_rate_hz, setup, &windows, sp)?;
+    let mut collector = trace_cfg.map(TraceCollector::new);
+    let use_full_spectrogram = cfg._full_spectrogram
+        && should_use_full_spectrogram(audio_mono.len(), setup, window_stats.windows.len());
+    let (acc, digest, beats) = build_fingerprints(
+        audio_mono,
+        sample_rate_hz,
+        setup,
+        use_full_spectrogram,
+        &window_stats.windows,
+        sp,
+        collector.as_mut(),
+    )?;
     let (rows, cols, target) = if cfg.kernel_target == KernelTarget::Accumulator {
         (setup.n_freq_taps, setup.fp_size, acc)
     } else {
@@ -195,7 +483,35 @@ where
     let kernel = make_kernel(cfg.kernel_type);
     let post = convolve_wrap_5x5(&target, rows, cols, &kernel);
     let flat = flatten_columns_sum(&post, rows, cols);
-    estimate_from_convolution(&flat, setup.actual_step_sec, cfg.magic_offset_ms)
+    let conv_stats = estimate_from_convolution(&flat, setup.actual_step_sec, cfg.magic_offset_ms)?;
+    if let Some(collector) = collector {
+        let setup_trace = BiasTraceSetup {
+            sample_rate_hz,
+            samples: audio_mono.len(),
+            nperseg: setup.nperseg,
+            nstep: setup.nstep,
+            noverlap: setup.nperseg.saturating_sub(setup.nstep),
+            actual_step_sec: setup.actual_step_sec,
+            fp_size: setup.fp_size,
+            n_freq_taps: setup.n_freq_taps,
+            n_time_taps: setup.n_time_taps,
+            spectrogram_offset: setup.spectrogram_offset,
+            min_sep_sec: cfg.fingerprint_ms * 1e-3,
+        };
+        let loop_stats = window_stats.loop_stats();
+        let trace = BiasTrace {
+            setup: setup_trace,
+            skip_counts: window_stats.skips,
+            loop_stats,
+            beat_head: collector.beat_head,
+            beat_tail: collector.beat_tail,
+            convolution: conv_stats.convolution,
+            result: conv_stats.result,
+        };
+        Ok(BiasResult::WithTrace(conv_stats.estimate, trace))
+    } else {
+        Ok(BiasResult::Estimate(conv_stats.estimate))
+    }
 }
 
 fn build_setup(audio_len: usize, sample_rate_hz: u32, cfg: &BiasCfg) -> Result<Setup, String> {
@@ -236,39 +552,47 @@ fn beat_windows_from_fn<F>(
     cfg: &BiasCfg,
     setup: Setup,
     mut beat_time_fn: F,
-) -> Vec<(usize, usize)>
+) -> BeatWindows
 where
     F: FnMut(usize) -> f64,
 {
-    let audio_duration_sec = audio_len as f64 / f64::from(sample_rate_hz);
+    let audio_duration_sec =
+        ((audio_len as f64 / f64::from(sample_rate_hz)) * 1000.0).floor() * 1e-3;
     let min_sep_sec = cfg.fingerprint_ms * 1e-3;
-    let mut windows = Vec::new();
+    let mut out = BeatWindows::default();
     let mut t_last = f64::NEG_INFINITY;
     let mut beat = 0usize;
     while beat < 200_000 {
-        let t = beat_time_fn(beat);
+        let beat_i = beat;
+        let t = beat_time_fn(beat_i);
         beat += 1;
+        out.beats_scanned = beat;
         if !t.is_finite() {
             break;
         }
         if t < 0.0 {
+            out.skips.too_early += 1;
             continue;
         }
         if t > audio_duration_sec {
+            out.skips.too_late += 1;
             break;
         }
         if t - t_last < min_sep_sec {
+            out.skips.too_soon += 1;
             continue;
         }
         t_last = t;
-        if let Some(w) = beat_time_to_window_taps(t, setup) {
-            windows.push(w);
+        if let Some(w) = beat_time_to_window_taps(beat_i, t, setup) {
+            out.windows.push(w);
+        } else {
+            out.skips.short_window += 1;
         }
     }
-    windows
+    out
 }
 
-fn beat_time_to_window_taps(beat_time: f64, setup: Setup) -> Option<(usize, usize)> {
+fn beat_time_to_window_taps(beat_index: usize, beat_time: f64, setup: Setup) -> Option<BeatWindow> {
     let half = setup.fp_size as f64 * 0.5;
     let t_s = py_round(beat_time / setup.actual_step_sec - setup.spectrogram_offset - half);
     let t_f = py_round(beat_time / setup.actual_step_sec - setup.spectrogram_offset + half);
@@ -277,7 +601,14 @@ fn beat_time_to_window_taps(beat_time: f64, setup: Setup) -> Option<(usize, usiz
     if end - start != setup.fp_size as isize {
         None
     } else {
-        Some((start as usize, end as usize))
+        Some(BeatWindow {
+            beat_index,
+            beat_time_sec: beat_time,
+            t_s_raw: t_s,
+            t_f_raw: t_f,
+            t_s: start as usize,
+            t_f: end as usize,
+        })
     }
 }
 
@@ -305,8 +636,92 @@ fn build_fingerprints(
     audio_mono: &[f32],
     sample_rate_hz: u32,
     setup: Setup,
-    windows: &[(usize, usize)],
+    use_full_spectrogram: bool,
+    windows: &[BeatWindow],
     sp: &mut SpectrogramCtx,
+    trace: Option<&mut TraceCollector>,
+) -> Result<(Vec<f64>, Vec<f64>, usize), String> {
+    if use_full_spectrogram {
+        build_fingerprints_full(audio_mono, sample_rate_hz, setup, windows, sp, trace)
+    } else {
+        build_fingerprints_legacy(audio_mono, sample_rate_hz, setup, windows, sp, trace)
+    }
+}
+
+fn should_use_full_spectrogram(audio_len: usize, setup: Setup, windows: usize) -> bool {
+    if audio_len < setup.nperseg {
+        return false;
+    }
+    let full_cols = 1 + (audio_len - setup.nperseg) / setup.nstep;
+    let legacy_cols = windows.saturating_mul(setup.fp_size);
+    if full_cols > legacy_cols {
+        return false;
+    }
+    let Some(full_cells) = setup.n_freq_taps.checked_mul(full_cols) else {
+        return false;
+    };
+    let Some(full_bytes) = full_cells.checked_mul(std::mem::size_of::<f64>()) else {
+        return false;
+    };
+    full_bytes <= FULL_SPEC_MAX_BYTES
+}
+
+fn build_fingerprints_full(
+    audio_mono: &[f32],
+    sample_rate_hz: u32,
+    setup: Setup,
+    windows: &[BeatWindow],
+    sp: &mut SpectrogramCtx,
+    mut trace: Option<&mut TraceCollector>,
+) -> Result<(Vec<f64>, Vec<f64>, usize), String> {
+    let rows = setup.n_freq_taps;
+    let cols = setup.fp_size;
+    let Some(full_cols) =
+        spectrogram_log_full_into(audio_mono, setup.nperseg, setup.nstep, rows, sp)
+    else {
+        return Err("audio too short for full spectrogram".to_string());
+    };
+    let mut acc = vec![0.0; rows * cols];
+    let mut digest = Vec::with_capacity(windows.len() * cols);
+    let weights = frequency_weights(sample_rate_hz, setup.nperseg, rows);
+    let mut digest_row = vec![0.0; cols];
+    let mut beats = 0usize;
+    let fp_times_ms = fingerprint_times_ms(cols, setup.actual_step_sec);
+    for w in windows {
+        if !window_matches_legacy_rules(audio_mono.len(), setup, w.t_s, w.t_f, cols, full_cols) {
+            continue;
+        }
+        digest_row.fill(0.0);
+        apply_window_weighting(
+            &sp.out,
+            &weights,
+            rows,
+            cols,
+            full_cols,
+            w.t_s,
+            &mut acc,
+            &mut digest_row,
+        );
+        if let Some(rec) = trace.as_mut() {
+            rec.push_beat(beat_trace(w, &digest_row, &fp_times_ms));
+        }
+        digest.extend_from_slice(&digest_row);
+        beats += 1;
+    }
+    if beats == 0 {
+        Err("no valid beat snippets for spectrogram digest".to_string())
+    } else {
+        Ok((acc, digest, beats))
+    }
+}
+
+fn build_fingerprints_legacy(
+    audio_mono: &[f32],
+    sample_rate_hz: u32,
+    setup: Setup,
+    windows: &[BeatWindow],
+    sp: &mut SpectrogramCtx,
+    mut trace: Option<&mut TraceCollector>,
 ) -> Result<(Vec<f64>, Vec<f64>, usize), String> {
     let rows = setup.n_freq_taps;
     let cols = setup.fp_size;
@@ -315,9 +730,10 @@ fn build_fingerprints(
     let weights = frequency_weights(sample_rate_hz, setup.nperseg, rows);
     let mut digest_row = vec![0.0; cols];
     let mut beats = 0usize;
-    for (t_s, t_f) in windows {
-        let sample_s = t_s.saturating_mul(setup.nstep);
-        let sample_f = (t_f.saturating_mul(setup.nstep) + setup.nperseg.saturating_sub(1))
+    let fp_times_ms = fingerprint_times_ms(cols, setup.actual_step_sec);
+    for w in windows {
+        let sample_s = w.t_s.saturating_mul(setup.nstep);
+        let sample_f = (w.t_f.saturating_mul(setup.nstep) + setup.nperseg.saturating_sub(1))
             .min(audio_mono.len());
         if sample_f <= sample_s + setup.nperseg {
             continue;
@@ -333,7 +749,19 @@ fn build_fingerprints(
             continue;
         }
         digest_row.fill(0.0);
-        apply_frequency_weighting(&sp.out, &weights, rows, cols, &mut acc, &mut digest_row);
+        apply_window_weighting(
+            &sp.out,
+            &weights,
+            rows,
+            cols,
+            cols,
+            0,
+            &mut acc,
+            &mut digest_row,
+        );
+        if let Some(rec) = trace.as_mut() {
+            rec.push_beat(beat_trace(w, &digest_row, &fp_times_ms));
+        }
         digest.extend_from_slice(&digest_row);
         beats += 1;
     }
@@ -342,6 +770,35 @@ fn build_fingerprints(
     } else {
         Ok((acc, digest, beats))
     }
+}
+
+fn spectrogram_log_full_into(
+    samples: &[f32],
+    nperseg: usize,
+    nstep: usize,
+    rows: usize,
+    sp: &mut SpectrogramCtx,
+) -> Option<usize> {
+    if samples.len() < nperseg {
+        return None;
+    }
+    let cols = 1 + (samples.len() - nperseg) / nstep;
+    if sp.out.len() != rows * cols {
+        sp.out.resize(rows * cols, 0.0);
+    }
+    for c in 0..cols {
+        let base = c * nstep;
+        for i in 0..nperseg {
+            sp.buf[i].re = f64::from(samples[base + i]) * sp.window[i];
+            sp.buf[i].im = 0.0;
+        }
+        sp.fft.process(&mut sp.buf);
+        for r in 0..rows {
+            let v = sp.buf[r];
+            sp.out[r * cols + c] = (v.re.mul_add(v.re, v.im * v.im) + EPS).log2();
+        }
+    }
+    Some(cols)
 }
 
 fn spectrogram_log_into(
@@ -377,22 +834,70 @@ fn spectrogram_log_into(
     true
 }
 
-fn apply_frequency_weighting(
-    log_spec: &[f64],
+fn window_matches_legacy_rules(
+    audio_len: usize,
+    setup: Setup,
+    t_s: usize,
+    t_f: usize,
+    cols: usize,
+    full_cols: usize,
+) -> bool {
+    let sample_s = t_s.saturating_mul(setup.nstep);
+    let sample_f =
+        (t_f.saturating_mul(setup.nstep) + setup.nperseg.saturating_sub(1)).min(audio_len);
+    if sample_f <= sample_s + setup.nperseg {
+        return false;
+    }
+    let local_cols = 1 + (sample_f - sample_s - setup.nperseg) / setup.nstep;
+    local_cols == cols && t_s.checked_add(cols).is_some_and(|end| end <= full_cols)
+}
+
+fn apply_window_weighting(
+    full_log_spec: &[f64],
     weights: &[f64],
     rows: usize,
     cols: usize,
+    full_cols: usize,
+    start_col: usize,
     acc: &mut [f64],
     digest_row: &mut [f64],
 ) {
     for r in 0..rows {
         let w = weights[r];
-        let row_off = r * cols;
+        let src_off = r * full_cols + start_col;
+        let dst_off = r * cols;
         for c in 0..cols {
-            let v = log_spec[row_off + c] * w;
-            acc[row_off + c] += v;
+            let v = full_log_spec[src_off + c] * w;
+            acc[dst_off + c] += v;
             digest_row[c] += v;
         }
+    }
+}
+
+fn beat_trace(window: &BeatWindow, digest_row: &[f64], fp_times_ms: &[f64]) -> BiasTraceBeat {
+    let peak_idx = argmax(digest_row);
+    let digest_mean = digest_row.iter().sum::<f64>() / digest_row.len() as f64;
+    let digest_var = digest_row
+        .iter()
+        .map(|v| {
+            let d = *v - digest_mean;
+            d * d
+        })
+        .sum::<f64>()
+        / digest_row.len() as f64;
+    BiasTraceBeat {
+        beat_index: window.beat_index,
+        beat_time_s: window.beat_time_sec,
+        window_time_idx_raw_start: window.t_s_raw,
+        window_time_idx_raw_end: window.t_f_raw,
+        window_time_idx_start: window.t_s,
+        window_time_idx_end: window.t_f,
+        digest_min: digest_row.iter().copied().fold(f64::INFINITY, f64::min),
+        digest_max: digest_row.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        digest_mean,
+        digest_std: digest_var.sqrt(),
+        digest_peak_idx: peak_idx,
+        digest_peak_ms: fp_times_ms.get(peak_idx).copied().unwrap_or(0.0),
     }
 }
 
@@ -467,22 +972,22 @@ fn estimate_from_convolution(
     post_kernel_flat: &[f64],
     actual_step_sec: f64,
     magic_offset_ms: f64,
-) -> Result<BiasEstimate, String> {
+) -> Result<ConvStats, String> {
     let edge_discard = 2usize;
     if post_kernel_flat.len() <= edge_discard * 2 {
         return Err("convolution output too small for edge discard".to_string());
     }
     let clip = &post_kernel_flat[edge_discard..post_kernel_flat.len() - edge_discard];
-    let i_max = argmax(clip);
+    let v_clip = normalize_0_1(clip);
+    let v20 = percentile(&v_clip, 20.0);
+    let v80 = percentile(&v_clip, 80.0);
+    let conv_quint = v80 - v20;
+    let i_max = stabilized_peak_index(clip, argmax(clip), conv_quint);
     let times_ms = fingerprint_times_ms(post_kernel_flat.len(), actual_step_sec);
     let bias_ms = times_ms[i_max + edge_discard] + magic_offset_ms;
-
-    let v_clip = normalize_0_1(clip);
     let t_clip = &times_ms[edge_discard..post_kernel_flat.len() - edge_discard];
     let v_std = stdev_population(&v_clip);
     let v_median = percentile(&v_clip, 50.0);
-    let v20 = percentile(&v_clip, 20.0);
-    let v80 = percentile(&v_clip, 80.0);
     let v_max = v_clip[i_max];
     let t_peak = t_clip[i_max];
 
@@ -492,13 +997,50 @@ fn estimate_from_convolution(
         let close = ((t_clip[i] - t_peak).abs() - NEARNESS_OFFSET).max(0.0) / NEARNESS_SCALAR;
         total += rival.powi(4) * close.powf(1.5);
     }
-    let total = total / v_clip.len() as f64;
-    let confidence = (((1.0 - total.powf(0.2)) / THEORETICAL_UPPER).min(1.0)).clamp(0.0, 1.0);
-    Ok(BiasEstimate {
+    let total_max_influence = total / v_clip.len() as f64;
+    let confidence =
+        (((1.0 - total_max_influence.powf(0.2)) / THEORETICAL_UPPER).min(1.0)).clamp(0.0, 1.0);
+    let estimate = BiasEstimate {
         bias_ms,
         confidence,
-        conv_quint: v80 - v20,
+        conv_quint,
         conv_stdev: v_std,
+    };
+    let mut peak_idx = (0..clip.len()).collect::<Vec<_>>();
+    peak_idx.sort_by(|a, b| clip[*b].total_cmp(&clip[*a]));
+    peak_idx.truncate(12);
+    let convolution = BiasTraceConv {
+        edge_discard,
+        clip_min: clip.iter().copied().fold(f64::INFINITY, f64::min),
+        clip_max: clip.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        clip_mean: clip.iter().sum::<f64>() / clip.len() as f64,
+        clip_std: stdev_population(clip),
+        top_peaks: peak_idx
+            .into_iter()
+            .map(|i| BiasTracePeak {
+                clip_index: i,
+                full_index: i + edge_discard,
+                time_ms: times_ms[i + edge_discard],
+                value: clip[i],
+            })
+            .collect(),
+    };
+    let result = BiasTraceResult {
+        bias_ms,
+        confidence,
+        conv_quint: estimate.conv_quint,
+        conv_stdev: estimate.conv_stdev,
+        i_max,
+        v_median,
+        v_max,
+        v20,
+        v80,
+        total_max_influence,
+    };
+    Ok(ConvStats {
+        estimate,
+        convolution,
+        result,
     })
 }
 
@@ -525,6 +1067,27 @@ fn argmax(values: &[f64]) -> usize {
         }
     }
     idx
+}
+
+fn stabilized_peak_index(values: &[f64], i_max: usize, conv_quint: f64) -> usize {
+    if conv_quint > PEAK_STABILIZE_QUINT_MAX {
+        return i_max;
+    }
+    let peak = values[i_max];
+    if !peak.is_finite() {
+        return i_max;
+    }
+    let floor = peak * (1.0 - PEAK_STABILIZE_REL_EPS);
+    let mut pick = i_max;
+    let end = values
+        .len()
+        .min(i_max.saturating_add(PEAK_STABILIZE_MAX_SHIFT + 1));
+    for (j, v) in values.iter().enumerate().take(end).skip(i_max + 1) {
+        if *v >= floor {
+            pick = j;
+        }
+    }
+    pick
 }
 
 fn normalize_0_1(values: &[f64]) -> Vec<f64> {
@@ -590,7 +1153,8 @@ fn rivaling_strength(value: f64, median: f64, vmax: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BiasCfg, BiasRuntime, estimate_bias_with_beat_fn, estimate_bias_with_beat_fn_reuse,
+        BeatWindow, BiasCfg, BiasRuntime, Setup, SpectrogramCtx, build_fingerprints_full,
+        build_fingerprints_legacy, estimate_bias_with_beat_fn, estimate_bias_with_beat_fn_reuse,
         make_kernel, percentile,
     };
     use crate::model::{BiasKernel, KernelTarget};
@@ -638,22 +1202,16 @@ mod tests {
             estimate_bias_with_beat_fn(&audio, sample_rate, &cfg, |beat| beat as f64 * 0.25)
                 .expect("one-shot estimate should succeed");
         let mut runtime = BiasRuntime::default();
-        let first = estimate_bias_with_beat_fn_reuse(
-            &audio,
-            sample_rate,
-            &cfg,
-            &mut runtime,
-            |beat| beat as f64 * 0.25,
-        )
-        .expect("first cached estimate should succeed");
-        let second = estimate_bias_with_beat_fn_reuse(
-            &audio,
-            sample_rate,
-            &cfg,
-            &mut runtime,
-            |beat| beat as f64 * 0.25,
-        )
-        .expect("second cached estimate should succeed");
+        let first =
+            estimate_bias_with_beat_fn_reuse(&audio, sample_rate, &cfg, &mut runtime, |beat| {
+                beat as f64 * 0.25
+            })
+            .expect("first cached estimate should succeed");
+        let second =
+            estimate_bias_with_beat_fn_reuse(&audio, sample_rate, &cfg, &mut runtime, |beat| {
+                beat as f64 * 0.25
+            })
+            .expect("second cached estimate should succeed");
         assert!((one_shot.bias_ms - first.bias_ms).abs() < 1e-12);
         assert!((one_shot.confidence - first.confidence).abs() < 1e-12);
         assert!((one_shot.conv_quint - first.conv_quint).abs() < 1e-12);
@@ -662,5 +1220,75 @@ mod tests {
         assert!((first.confidence - second.confidence).abs() < 1e-12);
         assert!((first.conv_quint - second.conv_quint).abs() < 1e-12);
         assert!((first.conv_stdev - second.conv_stdev).abs() < 1e-12);
+    }
+
+    #[test]
+    fn full_spectrogram_matches_legacy_fingerprints() {
+        let sample_rate = 8_000u32;
+        let mut audio = Vec::with_capacity(400);
+        for i in 0..400 {
+            let t = i as f32 * 0.07;
+            audio.push((t.sin() * 0.8) + (t * 0.5).cos() * 0.2);
+        }
+        let setup = Setup {
+            nperseg: 32,
+            nstep: 8,
+            fp_size: 10,
+            n_freq_taps: 17,
+            n_time_taps: 0,
+            actual_step_sec: 0.0,
+            spectrogram_offset: 0.0,
+        };
+        let windows = vec![
+            BeatWindow {
+                beat_index: 0,
+                beat_time_sec: 0.0,
+                t_s_raw: 0,
+                t_f_raw: 10,
+                t_s: 0,
+                t_f: 10,
+            },
+            BeatWindow {
+                beat_index: 5,
+                beat_time_sec: 0.0,
+                t_s_raw: 5,
+                t_f_raw: 15,
+                t_s: 5,
+                t_f: 15,
+            },
+            BeatWindow {
+                beat_index: 9,
+                beat_time_sec: 0.0,
+                t_s_raw: 9,
+                t_f_raw: 19,
+                t_s: 9,
+                t_f: 19,
+            },
+            BeatWindow {
+                beat_index: 20,
+                beat_time_sec: 0.0,
+                t_s_raw: 20,
+                t_f_raw: 30,
+                t_s: 20,
+                t_f: 30,
+            },
+        ];
+        let mut sp_full = SpectrogramCtx::new(setup.nperseg);
+        let mut sp_legacy = SpectrogramCtx::new(setup.nperseg);
+        let full =
+            build_fingerprints_full(&audio, sample_rate, setup, &windows, &mut sp_full, None)
+                .expect("full fingerprint build should succeed");
+        let legacy =
+            build_fingerprints_legacy(&audio, sample_rate, setup, &windows, &mut sp_legacy, None)
+                .expect("legacy fingerprint build should succeed");
+        assert_eq!(full.2, legacy.2);
+        assert_eq!(full.0.len(), legacy.0.len());
+        assert_eq!(full.1.len(), legacy.1.len());
+        for (a, b) in full.0.iter().zip(legacy.0.iter()) {
+            assert!((*a - *b).abs() < 1e-12);
+        }
+        for (a, b) in full.1.iter().zip(legacy.1.iter()) {
+            assert!((*a - *b).abs() < 1e-12);
+        }
     }
 }

@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
+use std::process::Command;
 
 use lewton::inside_ogg::OggStreamReader;
 
@@ -14,6 +15,77 @@ pub struct OggDecode {
 }
 
 pub fn decode_ogg_mono_like_python(path: &Path) -> Result<OggDecode, String> {
+    let (sample_rate_hz, source_channels) = probe_ogg_header(path)?;
+    match decoder_pref().as_deref() {
+        Some("lewton") | None => return decode_ogg_lewton(path),
+        Some("ffmpeg") => {
+            return decode_ogg_ffmpeg(path, sample_rate_hz, source_channels);
+        }
+        Some("auto") => {}
+        _ => {}
+    }
+    match decode_ogg_ffmpeg(path, sample_rate_hz, source_channels) {
+        Ok(decoded) => Ok(decoded),
+        Err(ffmpeg_err) => match decode_ogg_lewton(path) {
+            Ok(decoded) => Ok(decoded),
+            Err(lewton_err) => Err(format!(
+                "{ffmpeg_err}; fallback lewton decode failed: {lewton_err}"
+            )),
+        },
+    }
+}
+
+fn decoder_pref() -> Option<String> {
+    std::env::var("RNON_AUDIO_DECODER")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+}
+
+fn probe_ogg_header(path: &Path) -> Result<(u32, usize), String> {
+    let file = File::open(path).map_err(|e| format!("open {} failed: {e}", path.display()))?;
+    let reader = OggStreamReader::new(BufReader::with_capacity(OGG_BUF_CAP, file))
+        .map_err(|e| format!("ogg header parse {} failed: {e}", path.display()))?;
+    Ok((
+        reader.ident_hdr.audio_sample_rate,
+        usize::from(reader.ident_hdr.audio_channels),
+    ))
+}
+
+fn decode_ogg_ffmpeg(
+    path: &Path,
+    sample_rate_hz: u32,
+    source_channels: usize,
+) -> Result<OggDecode, String> {
+    let output = Command::new("ffmpeg")
+        .arg("-v")
+        .arg("error")
+        .arg("-i")
+        .arg(path)
+        .arg("-map")
+        .arg("a:0")
+        .arg("-f")
+        .arg("s16le")
+        .arg("-acodec")
+        .arg("pcm_s16le")
+        .arg("-")
+        .output()
+        .map_err(|e| format!("ffmpeg decode {} failed: {e}", path.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "ffmpeg decode {} failed: {}",
+            path.display(),
+            stderr.trim()
+        ));
+    }
+    Ok(OggDecode {
+        sample_rate_hz,
+        mono: mono_from_interleaved_pcm_i16(&output.stdout, source_channels),
+    })
+}
+
+fn decode_ogg_lewton(path: &Path) -> Result<OggDecode, String> {
     let file = File::open(path).map_err(|e| format!("open {} failed: {e}", path.display()))?;
     let mut reader = OggStreamReader::new(BufReader::with_capacity(OGG_BUF_CAP, file))
         .map_err(|e| format!("ogg header parse {} failed: {e}", path.display()))?;
@@ -30,6 +102,36 @@ pub fn decode_ogg_mono_like_python(path: &Path) -> Result<OggDecode, String> {
         sample_rate_hz,
         mono,
     })
+}
+
+fn mono_from_interleaved_pcm_i16(bytes: &[u8], channels: usize) -> Vec<f32> {
+    if channels == 0 {
+        return Vec::new();
+    }
+    if channels == 2 {
+        let mut out = Vec::with_capacity(bytes.len() / 4);
+        for frame in bytes.chunks_exact(4) {
+            let left = i16::from_le_bytes([frame[0], frame[1]]);
+            let right = i16::from_le_bytes([frame[2], frame[3]]);
+            out.push(f32::from(left.max(right)) * PCM_INV_SCALE);
+        }
+        return out;
+    }
+    if channels == 1 {
+        let mut out = Vec::with_capacity(bytes.len() / 2);
+        for sample in bytes.chunks_exact(2) {
+            out.push(f32::from(i16::from_le_bytes([sample[0], sample[1]])) * PCM_INV_SCALE);
+        }
+        return out;
+    }
+    let frame_bytes = channels * 2;
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for frame in bytes.chunks_exact(frame_bytes) {
+        for sample in frame.chunks_exact(2) {
+            out.push(f32::from(i16::from_le_bytes([sample[0], sample[1]])) * PCM_INV_SCALE);
+        }
+    }
+    out
 }
 
 fn append_python_mono_like(packet: &[Vec<i16>], channels: usize, out: &mut Vec<f32>) {
@@ -77,7 +179,7 @@ fn append_interleaved_passthrough(packet: &[Vec<i16>], out: &mut Vec<f32>) {
 
 #[cfg(test)]
 mod tests {
-    use super::append_python_mono_like;
+    use super::{append_python_mono_like, mono_from_interleaved_pcm_i16};
 
     #[test]
     fn stereo_collapse_uses_channel_max() {
@@ -109,5 +211,14 @@ mod tests {
         assert!((out[3] - (2.0 / 32768.0)).abs() < 1e-7);
         assert!((out[4] - (20.0 / 32768.0)).abs() < 1e-7);
         assert!((out[5] - (200.0 / 32768.0)).abs() < 1e-7);
+    }
+
+    #[test]
+    fn ffmpeg_pcm_stereo_uses_channel_max() {
+        let bytes = [100u8, 0, 200, 0, 0x80, 0xff, 0x00, 0x80];
+        let out = mono_from_interleaved_pcm_i16(&bytes, 2);
+        assert_eq!(out.len(), 2);
+        assert!((out[0] - (200.0 / 32768.0)).abs() < 1e-7);
+        assert!((out[1] - (-128.0 / 32768.0)).abs() < 1e-7);
     }
 }

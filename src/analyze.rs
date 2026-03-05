@@ -1,10 +1,15 @@
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use rssp::{AnalysisOptions, analyze};
+use serde::Serialize;
 
 use crate::audio::{OggDecode, decode_ogg_mono_like_python};
-use crate::bias::{BiasCfg, BiasRuntime, estimate_bias_reuse};
+use crate::bias::{
+    BiasCfg, BiasRuntime, BiasTrace, BiasTraceCfg, estimate_bias_reuse,
+    estimate_bias_reuse_with_trace,
+};
 use crate::cli::AnalyzeCmd;
 use crate::compat::guess_paradigm;
 use crate::compat::slot_abbreviation;
@@ -19,10 +24,11 @@ pub fn run(args: &AnalyzeCmd) -> Result<AnalyzeReport, String> {
         .map_err(|e| format!("create report dir {} failed: {e}", report_path.display()))?;
     let params = build_params(args, &report_path)?;
     let bias_cfg = bias_cfg_from_params(&params);
+    let trace_ctl = TraceCtl::from_env();
     let simfiles = discover_simfiles(&args.root_path)?;
     let scanned = simfiles
         .iter()
-        .map(|path| scan_one(path, &args.root_path, &params, &bias_cfg))
+        .map(|path| scan_one(path, &args.root_path, &params, &bias_cfg, &trace_ctl))
         .collect::<Vec<_>>();
     Ok(AnalyzeReport {
         tool: "rnon".to_string(),
@@ -31,6 +37,72 @@ pub fn run(args: &AnalyzeCmd) -> Result<AnalyzeReport, String> {
         params,
         simfile_count: scanned.len(),
         simfiles: scanned,
+    })
+}
+
+struct TraceCtl {
+    enabled: bool,
+    keep: usize,
+    tokens: Vec<String>,
+    dump_dir: Option<PathBuf>,
+}
+
+impl TraceCtl {
+    fn from_env() -> Self {
+        let enabled = env_bool("RNON_BIAS_TRACE");
+        let keep = env::var("RNON_BIAS_TRACE_KEEP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.max(1))
+            .unwrap_or(24);
+        let tokens = env::var("RNON_BIAS_TRACE_FILTER")
+            .ok()
+            .map(|raw| {
+                raw.split([',', ';'])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let dump_dir = env::var("RNON_BIAS_TRACE_DIR")
+            .ok()
+            .map(|v| PathBuf::from(v.trim()))
+            .filter(|p| !p.as_os_str().is_empty());
+        Self {
+            enabled,
+            keep,
+            tokens,
+            dump_dir,
+        }
+    }
+
+    fn matches(&self, simfile_path: &Path, chart: &rssp::ChartSummary, chart_index: usize) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if self.tokens.is_empty() {
+            return true;
+        }
+        let hay = format!(
+            "{}|{}|{}|{}|{}",
+            simfile_path.display(),
+            chart_index,
+            chart.step_type_str,
+            chart.difficulty_str,
+            chart.description_str
+        )
+        .to_ascii_lowercase();
+        self.tokens.iter().any(|t| hay.contains(t))
+    }
+}
+
+fn env_bool(name: &str) -> bool {
+    env::var(name).ok().is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
     })
 }
 
@@ -95,7 +167,13 @@ fn resolve_report_path(root: &Path, explicit: Option<&Path>) -> Result<PathBuf, 
     }
 }
 
-fn scan_one(path: &Path, root: &Path, params: &AnalyzeParams, bias_cfg: &BiasCfg) -> SimfileScan {
+fn scan_one(
+    path: &Path,
+    root: &Path,
+    params: &AnalyzeParams,
+    bias_cfg: &BiasCfg,
+    trace_ctl: &TraceCtl,
+) -> SimfileScan {
     let rel = rel_path(root, path);
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -116,6 +194,7 @@ fn scan_one(path: &Path, root: &Path, params: &AnalyzeParams, bias_cfg: &BiasCfg
                 &chart_music,
                 params,
                 bias_cfg,
+                trace_ctl,
             );
             SimfileScan {
                 simfile_path: path.display().to_string(),
@@ -277,6 +356,7 @@ fn apply_bias_estimates(
     chart_music: &[String],
     params: &AnalyzeParams,
     bias_cfg: &BiasCfg,
+    trace_ctl: &TraceCtl,
 ) {
     let mut cache = Vec::new();
     let mut bias_rt = BiasRuntime::default();
@@ -284,23 +364,60 @@ fn apply_bias_estimates(
         let scan = &mut chart_scans[i];
         let music_tag = chart_music.get(i).map_or("", String::as_str);
         match decode_song_audio_cached(simfile_path, music_tag, &mut cache) {
-            Ok(audio) => match estimate_bias_reuse(
-                &audio.mono,
-                audio.sample_rate_hz,
-                chart,
-                bias_cfg,
-                &mut bias_rt,
-            ) {
-                Ok(est) => write_bias(
-                    scan,
-                    est.bias_ms,
-                    est.confidence,
-                    est.conv_quint,
-                    est.conv_stdev,
-                    params,
-                ),
-                Err(err) => write_bias_error(scan, &err),
-            },
+            Ok(audio) => {
+                if trace_ctl.matches(simfile_path, chart, i) {
+                    match estimate_bias_reuse_with_trace(
+                        &audio.mono,
+                        audio.sample_rate_hz,
+                        chart,
+                        bias_cfg,
+                        &mut bias_rt,
+                        BiasTraceCfg {
+                            keep: trace_ctl.keep,
+                        },
+                    ) {
+                        Ok((est, trace)) => {
+                            write_bias(
+                                scan,
+                                est.bias_ms,
+                                est.confidence,
+                                est.conv_quint,
+                                est.conv_stdev,
+                                params,
+                            );
+                            let _ = dump_trace(
+                                simfile_path,
+                                chart,
+                                i,
+                                music_tag,
+                                params,
+                                &est,
+                                &trace,
+                                trace_ctl,
+                            );
+                        }
+                        Err(err) => write_bias_error(scan, &err),
+                    }
+                } else {
+                    match estimate_bias_reuse(
+                        &audio.mono,
+                        audio.sample_rate_hz,
+                        chart,
+                        bias_cfg,
+                        &mut bias_rt,
+                    ) {
+                        Ok(est) => write_bias(
+                            scan,
+                            est.bias_ms,
+                            est.confidence,
+                            est.conv_quint,
+                            est.conv_stdev,
+                            params,
+                        ),
+                        Err(err) => write_bias_error(scan, &err),
+                    }
+                }
+            }
             Err(err) => {
                 scan.status = "audio_unavailable".to_string();
                 scan.paradigm = Some("????".to_string());
@@ -368,6 +485,108 @@ fn is_ogg_path(path: &Path) -> bool {
     path.extension()
         .and_then(|s| s.to_str())
         .is_some_and(|s| s.eq_ignore_ascii_case("ogg"))
+}
+
+fn dump_trace(
+    simfile_path: &Path,
+    chart: &rssp::ChartSummary,
+    chart_index: usize,
+    music_tag: &str,
+    params: &AnalyzeParams,
+    est: &crate::bias::BiasEstimate,
+    trace: &BiasTrace,
+    ctl: &TraceCtl,
+) -> Result<(), String> {
+    let dump_dir = ctl.dump_dir.clone().unwrap_or_else(|| {
+        simfile_path
+            .parent()
+            .unwrap_or(simfile_path)
+            .join("__bias-check")
+    });
+    fs::create_dir_all(&dump_dir)
+        .map_err(|e| format!("create trace dir {} failed: {e}", dump_dir.display()))?;
+    let sim_stem = simfile_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("simfile");
+    let safe_sim = sanitize_file_stem(sim_stem);
+    let out_path = dump_dir.join(format!("rnon-trace-{safe_sim}-chart{chart_index}.json"));
+    let payload = AnalyzeTraceDump {
+        simfile_path: simfile_path.display().to_string(),
+        chart_index,
+        steps_type: chart.step_type_str.clone(),
+        difficulty: chart.difficulty_str.clone(),
+        description: chart.description_str.clone(),
+        music_tag: music_tag.to_string(),
+        params: AnalyzeTraceParams {
+            fingerprint_ms: params.fingerprint_ms,
+            window_ms: params.window_ms,
+            step_ms: params.step_ms,
+            magic_offset_ms: params.magic_offset_ms,
+            kernel_target: format!("{:?}", params.kernel_target),
+            kernel_type: format!("{:?}", params.kernel_type),
+            full_spectrogram: params.full_spectrogram,
+        },
+        estimate: AnalyzeTraceMetric {
+            bias_ms: est.bias_ms,
+            confidence: est.confidence,
+            conv_quint: est.conv_quint,
+            conv_stdev: est.conv_stdev,
+        },
+        trace: trace.clone(),
+    };
+    let json = serde_json::to_vec_pretty(&payload)
+        .map_err(|e| format!("trace json encode failed for {}: {e}", out_path.display()))?;
+    fs::write(&out_path, json)
+        .map_err(|e| format!("trace write failed for {}: {e}", out_path.display()))?;
+    Ok(())
+}
+
+fn sanitize_file_stem(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            out.push(ch);
+        } else {
+            out.push('-');
+        }
+    }
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    out.trim_matches('-').to_string()
+}
+
+#[derive(Clone, Serialize)]
+struct AnalyzeTraceDump {
+    simfile_path: String,
+    chart_index: usize,
+    steps_type: String,
+    difficulty: String,
+    description: String,
+    music_tag: String,
+    params: AnalyzeTraceParams,
+    estimate: AnalyzeTraceMetric,
+    trace: BiasTrace,
+}
+
+#[derive(Clone, Serialize)]
+struct AnalyzeTraceParams {
+    fingerprint_ms: f64,
+    window_ms: f64,
+    step_ms: f64,
+    magic_offset_ms: f64,
+    kernel_target: String,
+    kernel_type: String,
+    full_spectrogram: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct AnalyzeTraceMetric {
+    bias_ms: f64,
+    confidence: f64,
+    conv_quint: f64,
+    conv_stdev: f64,
 }
 
 #[cfg(test)]

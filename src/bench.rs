@@ -83,8 +83,14 @@ fn run_once(path: &Path, cfg: &BiasCfg) -> Result<RunSample, String> {
     let bias_start = Instant::now();
     let mut bias_rt = BiasRuntime::default();
     for chart in &summary.charts {
-        estimate_bias_reuse(&decode.mono, decode.sample_rate_hz, chart, cfg, &mut bias_rt)
-            .map_err(|e| format!("bias estimation failed: {e}"))?;
+        estimate_bias_reuse(
+            &decode.mono,
+            decode.sample_rate_hz,
+            chart,
+            cfg,
+            &mut bias_rt,
+        )
+        .map_err(|e| format!("bias estimation failed: {e}"))?;
     }
     let bias_estimation = bias_start.elapsed();
     let total = total_start.elapsed();

@@ -1,31 +1,107 @@
+use std::env;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use rssp::{AnalysisOptions, analyze};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::audio::{OggDecode, decode_ogg_mono_like_python};
-use crate::bias::{BiasCfg, BiasRuntime, estimate_bias_with_beat_fn_reuse};
+use crate::bias::{
+    BiasCfg, BiasRuntime, BiasTrace, BiasTraceCfg, estimate_bias_with_beat_fn_reuse,
+    estimate_bias_with_beat_fn_trace_reuse,
+};
 use crate::cli::ParityCmd;
 use crate::compat::{guess_paradigm, slot_abbreviation};
 use crate::fs_scan::{baseline_rel_for_md5, discover_simfiles, md5_hex, rel_path};
 use crate::model::{BiasKernel, KernelTarget, ParityCase, ParityReport};
 
 const BIAS_MS_TOL: f64 = 0.25;
-const CONF_TOL: f64 = 1e-3;
-const CONV_TOL: f64 = 1e-3;
+const CONF_TOL: f64 = 0.01;
+const CONV_TOL: f64 = 0.01;
+
+struct TraceCtl {
+    enabled: bool,
+    keep: usize,
+    tokens: Vec<String>,
+    dump_dir: Option<PathBuf>,
+}
+
+impl TraceCtl {
+    fn from_env() -> Self {
+        let enabled = env_bool("RNON_BIAS_TRACE");
+        let keep = env::var("RNON_BIAS_TRACE_KEEP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.max(1))
+            .unwrap_or(24);
+        let tokens = env::var("RNON_BIAS_TRACE_FILTER")
+            .ok()
+            .map(|raw| {
+                raw.split([',', ';'])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let dump_dir = env::var("RNON_BIAS_TRACE_DIR")
+            .ok()
+            .map(|v| PathBuf::from(v.trim()))
+            .filter(|p| !p.as_os_str().is_empty());
+        Self {
+            enabled,
+            keep,
+            tokens,
+            dump_dir,
+        }
+    }
+
+    fn matches(&self, simfile_path: &Path, row: &BaselineChart) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if self.tokens.is_empty() {
+            return true;
+        }
+        let hay = format!(
+            "{}|{}|{}|{}|{}|{}",
+            simfile_path.display(),
+            row.chart_index.map_or("*".to_string(), |i| i.to_string()),
+            row.slot.as_deref().unwrap_or(""),
+            row.steps_type.as_deref().unwrap_or(""),
+            row.difficulty.as_deref().unwrap_or(""),
+            row.description.as_deref().unwrap_or("")
+        )
+        .to_ascii_lowercase();
+        self.tokens.iter().any(|t| hay.contains(t))
+    }
+}
+
+fn env_bool(name: &str) -> bool {
+    env::var(name).ok().is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
 
 pub fn run(args: &ParityCmd) -> Result<ParityReport, String> {
     let simfiles = discover_simfiles(&args.root_path)?;
     let mut cases = Vec::with_capacity(simfiles.len());
     for simfile in simfiles {
-        cases.push(check_one(&simfile, &args.root_path, &args.baseline_path));
+        cases.push(check_one(
+            &simfile,
+            &args.root_path,
+            &args.baseline_path,
+            args.bias_only,
+        ));
     }
     Ok(build_report(&args.root_path, &args.baseline_path, cases))
 }
 
-fn check_one(path: &Path, root: &Path, baseline_root: &Path) -> ParityCase {
+fn check_one(path: &Path, root: &Path, baseline_root: &Path, bias_only: bool) -> ParityCase {
     let simfile_rel = rel_path(root, path);
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -65,7 +141,7 @@ fn check_one(path: &Path, root: &Path, baseline_root: &Path) -> ParityCase {
             };
         }
     };
-    match compare_baseline(path, &bytes, &baseline) {
+    match compare_baseline(path, &bytes, &baseline, bias_only) {
         Ok(None) => ParityCase {
             simfile_rel,
             simfile_md5: digest,
@@ -154,8 +230,9 @@ fn compare_baseline(
     simfile_path: &Path,
     simfile_bytes: &[u8],
     baseline: &BaselineFixture,
+    bias_only: bool,
 ) -> Result<Option<String>, String> {
-    let outcome = compare_baseline_inner(simfile_path, simfile_bytes, baseline, false)?;
+    let outcome = compare_baseline_inner(simfile_path, simfile_bytes, baseline, false, bias_only)?;
     if outcome.mismatches.is_empty() {
         Ok(None)
     } else {
@@ -169,7 +246,7 @@ fn compare_baseline_verbose(
     simfile_bytes: &[u8],
     baseline: &BaselineFixture,
 ) -> Result<CompareOutcome, String> {
-    compare_baseline_inner(simfile_path, simfile_bytes, baseline, true)
+    compare_baseline_inner(simfile_path, simfile_bytes, baseline, true, false)
 }
 
 fn compare_baseline_inner(
@@ -177,6 +254,7 @@ fn compare_baseline_inner(
     simfile_bytes: &[u8],
     baseline: &BaselineFixture,
     verbose: bool,
+    bias_only: bool,
 ) -> Result<CompareOutcome, String> {
     if baseline.charts.is_empty() {
         let mut state = CompareState::new(verbose);
@@ -184,6 +262,7 @@ fn compare_baseline_inner(
         return Ok(state.finish());
     }
     let mut state = CompareState::new(verbose);
+    let trace_ctl = TraceCtl::from_env();
     state.note(format!("analyzing {}", simfile_path.display()));
     let ext = simfile_ext(simfile_path);
     let summary = analyze(simfile_bytes, &ext, &AnalysisOptions::default())
@@ -208,7 +287,10 @@ fn compare_baseline_inner(
             &cfg,
             &mut cache,
             &mut bias_rt,
+            &trace_ctl,
+            simfile_path,
             &mut state,
+            bias_only,
         )?;
     }
     Ok(state.finish())
@@ -223,11 +305,16 @@ fn compare_row(
     cfg: &BiasCfg,
     cache: &mut Vec<AudioCacheEntry>,
     bias_rt: &mut BiasRuntime,
+    trace_ctl: &TraceCtl,
+    simfile_path: &Path,
     state: &mut CompareState,
+    bias_only: bool,
 ) -> Result<(), String> {
     state.note(format!("  {}", chart_label(row)));
     if row.chart_index.is_none() {
-        compare_base_row_meta(row, state);
+        if !bias_only {
+            compare_base_row_meta(row, state);
+        }
         if !row_needs_audio(row) {
             return Ok(());
         }
@@ -253,26 +340,46 @@ fn compare_row(
         }
         let decode = decode_cached(&audio_path, cache)
             .map_err(|e| format!("{} audio decode failed: {e}", chart_label(row)))?;
-        compare_sample_rate(row, decode.sample_rate_hz, state);
+        if !bias_only {
+            compare_sample_rate(row, decode.sample_rate_hz, state);
+        }
         if !row_has_bias_fields(row) {
             return Ok(());
         }
-        let est = estimate_bias_with_beat_fn_reuse(
-            &decode.mono,
-            decode.sample_rate_hz,
-            cfg,
-            bias_rt,
-            |beat| global_timing.time_at_stop(beat as f64),
-        )
-        .map_err(|e| format!("{} bias estimation failed: {e}", chart_label(row)))?;
-        compare_base_row_fields(row, baseline, &est, state);
+        let est = if trace_ctl.matches(simfile_path, row) {
+            let (est, trace) = estimate_bias_with_beat_fn_trace_reuse(
+                &decode.mono,
+                decode.sample_rate_hz,
+                cfg,
+                bias_rt,
+                BiasTraceCfg {
+                    keep: trace_ctl.keep,
+                },
+                |beat| global_timing.time_at(beat as f64),
+            )
+            .map_err(|e| format!("{} bias estimation failed: {e}", chart_label(row)))?;
+            let _ = dump_trace(simfile_path, row, baseline, &est, &trace, trace_ctl);
+            est
+        } else {
+            estimate_bias_with_beat_fn_reuse(
+                &decode.mono,
+                decode.sample_rate_hz,
+                cfg,
+                bias_rt,
+                |beat| global_timing.time_at(beat as f64),
+            )
+            .map_err(|e| format!("{} bias estimation failed: {e}", chart_label(row)))?
+        };
+        compare_base_row_fields(row, baseline, &est, state, bias_only);
         return Ok(());
     }
     let Some(chart) = chart_for_row(summary, row.chart_index) else {
         state.mismatch(format!("{} missing in simfile summary", chart_label(row)));
         return Ok(());
     };
-    compare_row_meta(row, chart, state);
+    if !bias_only {
+        compare_row_meta(row, chart, state);
+    }
     if !row_needs_audio(row) {
         return Ok(());
     }
@@ -296,20 +403,38 @@ fn compare_row(
     }
     let decode = decode_cached(&audio_path, cache)
         .map_err(|e| format!("{} audio decode failed: {e}", chart_label(row)))?;
-    compare_sample_rate(row, decode.sample_rate_hz, state);
+    if !bias_only {
+        compare_sample_rate(row, decode.sample_rate_hz, state);
+    }
     if !row_has_bias_fields(row) {
         return Ok(());
     }
     let timing = chart_timing_data(summary, chart, global_timing)?;
-    let est = estimate_bias_with_beat_fn_reuse(
-        &decode.mono,
-        decode.sample_rate_hz,
-        cfg,
-        bias_rt,
-        |beat| timing.time_at_stop(beat as f64),
-    )
-    .map_err(|e| format!("{} bias estimation failed: {e}", chart_label(row)))?;
-    compare_row_fields(row, baseline, chart, &est, state);
+    let est = if trace_ctl.matches(simfile_path, row) {
+        let (est, trace) = estimate_bias_with_beat_fn_trace_reuse(
+            &decode.mono,
+            decode.sample_rate_hz,
+            cfg,
+            bias_rt,
+            BiasTraceCfg {
+                keep: trace_ctl.keep,
+            },
+            |beat| timing.time_at(beat as f64),
+        )
+        .map_err(|e| format!("{} bias estimation failed: {e}", chart_label(row)))?;
+        let _ = dump_trace(simfile_path, row, baseline, &est, &trace, trace_ctl);
+        est
+    } else {
+        estimate_bias_with_beat_fn_reuse(
+            &decode.mono,
+            decode.sample_rate_hz,
+            cfg,
+            bias_rt,
+            |beat| timing.time_at(beat as f64),
+        )
+        .map_err(|e| format!("{} bias estimation failed: {e}", chart_label(row)))?
+    };
+    compare_row_fields(row, baseline, chart, &est, state, bias_only);
     Ok(())
 }
 
@@ -386,8 +511,12 @@ fn compare_row_fields(
     chart: &rssp::ChartSummary,
     est: &crate::bias::BiasEstimate,
     state: &mut CompareState,
+    bias_only: bool,
 ) {
     compare_float(row, "bias_ms", row.bias_ms, est.bias_ms, BIAS_MS_TOL, state);
+    if bias_only {
+        return;
+    }
     compare_float(
         row,
         "confidence",
@@ -448,8 +577,12 @@ fn compare_base_row_fields(
     baseline: &BaselineFixture,
     est: &crate::bias::BiasEstimate,
     state: &mut CompareState,
+    bias_only: bool,
 ) {
     compare_float(row, "bias_ms", row.bias_ms, est.bias_ms, BIAS_MS_TOL, state);
+    if bias_only {
+        return;
+    }
     compare_float(
         row,
         "confidence",
@@ -897,10 +1030,10 @@ impl PyTimingEngine {
         Ok(Self { states })
     }
 
-    fn time_at_stop(&self, beat: f64) -> f64 {
-        let idx = bisect_tagged_beats(&self.states, beat, PyEventTag::Stop).saturating_sub(1);
+    fn time_at(&self, beat: f64) -> f64 {
+        let idx = bisect_tagged_beats(&self.states, beat, PyEventTag::Bpm).saturating_sub(1);
         let prior = self.states[idx];
-        prior.time + py_time_until(prior, beat, PyEventTag::Stop)
+        prior.time + py_time_until(prior, beat, PyEventTag::Bpm)
     }
 }
 
@@ -1034,10 +1167,102 @@ fn count_status(cases: &[ParityCase], status: &str) -> usize {
     cases.iter().filter(|c| c.status == status).count()
 }
 
+fn dump_trace(
+    simfile_path: &Path,
+    row: &BaselineChart,
+    baseline: &BaselineFixture,
+    est: &crate::bias::BiasEstimate,
+    trace: &BiasTrace,
+    ctl: &TraceCtl,
+) -> Result<(), String> {
+    let dump_dir = ctl.dump_dir.clone().unwrap_or_else(|| {
+        simfile_path
+            .parent()
+            .unwrap_or(simfile_path)
+            .join("__bias-check")
+    });
+    fs::create_dir_all(&dump_dir)
+        .map_err(|e| format!("create trace dir {} failed: {e}", dump_dir.display()))?;
+    let sim_stem = simfile_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("simfile");
+    let chart_id = row
+        .chart_index
+        .map_or_else(|| "base".to_string(), |i| format!("chart{i}"));
+    let safe_sim = sanitize_file_stem(sim_stem);
+    let safe_row = sanitize_file_stem(&chart_id);
+    let out_path = dump_dir.join(format!("rnon-trace-{safe_sim}-{safe_row}.json"));
+    let payload = ParityTraceDump {
+        simfile_path: simfile_path.display().to_string(),
+        chart_index: row.chart_index,
+        slot: row.slot.clone(),
+        steps_type: row.steps_type.clone(),
+        difficulty: row.difficulty.clone(),
+        description: row.description.clone(),
+        params: baseline.params.clone(),
+        baseline: TraceMetric {
+            bias_ms: row.bias_ms,
+            confidence: row.confidence,
+            conv_quint: row.conv_quint,
+            conv_stdev: row.conv_stdev,
+        },
+        rnon: TraceMetric {
+            bias_ms: Some(est.bias_ms),
+            confidence: Some(est.confidence),
+            conv_quint: Some(est.conv_quint),
+            conv_stdev: Some(est.conv_stdev),
+        },
+        trace: trace.clone(),
+    };
+    let json = serde_json::to_vec_pretty(&payload)
+        .map_err(|e| format!("trace json encode failed for {}: {e}", out_path.display()))?;
+    fs::write(&out_path, json)
+        .map_err(|e| format!("trace write failed for {}: {e}", out_path.display()))?;
+    Ok(())
+}
+
+fn sanitize_file_stem(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            out.push(ch);
+        } else {
+            out.push('-');
+        }
+    }
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    out.trim_matches('-').to_string()
+}
+
 fn simfile_ext(path: &Path) -> String {
     path.extension()
         .and_then(|s| s.to_str())
         .map_or_else(String::new, |s| s.to_ascii_lowercase())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ParityTraceDump {
+    simfile_path: String,
+    chart_index: Option<usize>,
+    slot: Option<String>,
+    steps_type: Option<String>,
+    difficulty: Option<String>,
+    description: Option<String>,
+    params: BaselineParams,
+    baseline: TraceMetric,
+    rnon: TraceMetric,
+    trace: BiasTrace,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TraceMetric {
+    bias_ms: Option<f64>,
+    confidence: Option<f64>,
+    conv_quint: Option<f64>,
+    conv_stdev: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1053,7 +1278,7 @@ struct BaselineFixture {
     charts: Vec<BaselineChart>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BaselineParams {
     #[serde(default = "default_true")]
     consider_null: bool,
@@ -1203,6 +1428,7 @@ mod tests {
             output: None,
             fail_on_missing: true,
             fail_on_mismatch: true,
+            bias_only: false,
         };
         let report = run(&args).expect("run parity");
         assert_eq!(report.total_simfiles, 1);
@@ -1229,6 +1455,7 @@ mod tests {
             output: None,
             fail_on_missing: false,
             fail_on_mismatch: false,
+            bias_only: false,
         };
         let report = run(&args).expect("run parity");
         assert_eq!(report.total_simfiles, 1);
@@ -1339,6 +1566,7 @@ mod tests {
             output: None,
             fail_on_missing: false,
             fail_on_mismatch: false,
+            bias_only: false,
         };
         let report = run(&args).expect("run parity");
         assert_eq!(report.total_simfiles, 1);

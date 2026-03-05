@@ -81,6 +81,9 @@ pub struct ParityCmd {
 
     #[arg(long = "fail-on-mismatch")]
     pub fail_on_mismatch: bool,
+
+    #[arg(long = "bias-only")]
+    pub bias_only: bool,
 }
 
 #[derive(Debug, Parser)]
