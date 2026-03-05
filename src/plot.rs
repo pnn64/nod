@@ -6,7 +6,7 @@ use std::path::Path;
 use png::{BitDepth, ColorType, Encoder};
 use serde_json::Value;
 
-use crate::bias::BiasPlotData;
+use crate::bias::{BiasPlotData, GraphOrientation};
 use crate::cli::PlotCmd;
 use crate::model::{KernelTarget, PlotReport};
 
@@ -113,6 +113,15 @@ pub fn write_nine_or_null_plots(
     stem: &str,
     plot: &BiasPlotData,
 ) -> Result<(), String> {
+    write_nine_or_null_plots_oriented(report_dir, stem, plot, GraphOrientation::Vertical)
+}
+
+pub fn write_nine_or_null_plots_oriented(
+    report_dir: &Path,
+    stem: &str,
+    plot: &BiasPlotData,
+    orientation: GraphOrientation,
+) -> Result<(), String> {
     if stem.trim().is_empty() {
         return Err("plot stem is empty".to_string());
     }
@@ -135,6 +144,7 @@ pub fn write_nine_or_null_plots(
         plot.bias_ms,
         None,
         dims,
+        orientation,
     )?;
     let digest_path = report_dir.join(format!("bias-beatdigest-{stem}.png"));
     write_heat_plot(
@@ -149,6 +159,7 @@ pub fn write_nine_or_null_plots(
         plot.bias_ms,
         Some((10.0, 90.0)),
         dims,
+        orientation,
     )?;
     let post_path = report_dir.join(format!("bias-postkernel-{stem}.png"));
     let post_y = if plot.post_target == KernelTarget::Accumulator {
@@ -168,6 +179,7 @@ pub fn write_nine_or_null_plots(
         plot.bias_ms,
         Some((3.0, 97.0)),
         dims,
+        orientation,
     )
 }
 
@@ -184,6 +196,7 @@ fn write_heat_plot(
     bias_ms: f64,
     clim_pct: Option<(f64, f64)>,
     dims: (u32, u32),
+    orientation: GraphOrientation,
 ) -> Result<(), String> {
     if rows == 0 || cols == 0 {
         return Err(format!(
@@ -213,9 +226,18 @@ fn write_heat_plot(
     let (y_lo, y_hi) = axis_minmax(y_axis);
     let mut image = vec![0u8; (width as usize) * (height as usize) * 4];
     for py in 0..height {
-        let row = (((height - 1 - py) as usize) * rows / height as usize).min(rows - 1);
         for px in 0..width {
-            let col = ((px as usize) * cols / width as usize).min(cols - 1);
+            let (row, col) = if orientation == GraphOrientation::Vertical {
+                (
+                    (((height - 1 - py) as usize) * rows / height as usize).min(rows - 1),
+                    ((px as usize) * cols / width as usize).min(cols - 1),
+                )
+            } else {
+                (
+                    ((px as usize) * rows / width as usize).min(rows - 1),
+                    (((height - 1 - py) as usize) * cols / height as usize).min(cols - 1),
+                )
+            };
             let val = matrix[row * cols + col];
             let t = norm01(val, z_lo, z_hi);
             let rgb = viridis(t);
@@ -226,8 +248,18 @@ fn write_heat_plot(
             image[idx + 3] = 255;
         }
     }
-    let red_x = time_to_px(bias_ms, times_ms, width);
-    draw_vline(&mut image, width, height, red_x, [220, 20, 20, 255]);
+    if orientation == GraphOrientation::Vertical {
+        let red_x = time_to_px(bias_ms, times_ms, width);
+        draw_vline(&mut image, width, height, red_x, [220, 20, 20, 255]);
+    } else {
+        let red_y = y_to_px(
+            bias_ms,
+            times_ms[0],
+            *times_ms.last().unwrap_or(&times_ms[0]),
+            height,
+        );
+        draw_hline(&mut image, width, height, red_y, [220, 20, 20, 255]);
+    }
     draw_conv_line(
         &mut image,
         width,
@@ -237,6 +269,7 @@ fn write_heat_plot(
         y_hi,
         convolution,
         edge_discard,
+        orientation,
     );
     write_rgba_png(out_path, width, height, &image)
 }
@@ -283,6 +316,7 @@ fn draw_conv_line(
     y_max: f64,
     conv: &[f64],
     edge_discard: usize,
+    orientation: GraphOrientation,
 ) {
     if conv.len() < 3 {
         return;
@@ -295,9 +329,23 @@ fn draw_conv_line(
     let y_to = y_min * 0.1 + y_max * 0.9;
     let mut prev: Option<(i32, i32)> = None;
     for i in 0..conv.len() {
-        let x = time_to_px(times_ms[i], times_ms, width) as i32;
         let y_val = lerp(y_from, y_to, norm01(conv[i], c_lo, c_hi));
-        let y = y_to_px(y_val, y_min, y_max, height) as i32;
+        let (x, y) = if orientation == GraphOrientation::Vertical {
+            (
+                time_to_px(times_ms[i], times_ms, width) as i32,
+                y_to_px(y_val, y_min, y_max, height) as i32,
+            )
+        } else {
+            (
+                x_to_px(y_val, y_min, y_max, width) as i32,
+                y_to_px(
+                    times_ms[i],
+                    times_ms[0],
+                    *times_ms.last().unwrap_or(&times_ms[0]),
+                    height,
+                ) as i32,
+            )
+        };
         if let Some((px, py)) = prev {
             draw_line(image, width, height, px, py, x, y, [255, 255, 255, 255]);
         }
@@ -348,6 +396,19 @@ fn put_px(image: &mut [u8], width: u32, height: u32, x: i32, y: i32, rgba: [u8; 
     image[idx + 3] = rgba[3];
 }
 
+fn draw_hline(image: &mut [u8], width: u32, height: u32, y: u32, rgba: [u8; 4]) {
+    if y >= height {
+        return;
+    }
+    for x in 0..width {
+        let idx = ((y * width + x) * 4) as usize;
+        image[idx] = rgba[0];
+        image[idx + 1] = rgba[1];
+        image[idx + 2] = rgba[2];
+        image[idx + 3] = rgba[3];
+    }
+}
+
 fn time_to_px(time_ms: f64, times_ms: &[f64], width: u32) -> u32 {
     if times_ms.is_empty() || width <= 1 {
         return 0;
@@ -364,6 +425,14 @@ fn y_to_px(y_val: f64, y_min: f64, y_max: f64, height: u32) -> u32 {
     }
     let t = norm01(y_val, y_min, y_max);
     ((1.0 - t) * f64::from(height - 1)).round() as u32
+}
+
+fn x_to_px(x_val: f64, x_min: f64, x_max: f64, width: u32) -> u32 {
+    if width <= 1 {
+        return 0;
+    }
+    let t = norm01(x_val, x_min, x_max);
+    (t * f64::from(width - 1)).round() as u32
 }
 
 fn norm01(v: f64, lo: f64, hi: f64) -> f64 {

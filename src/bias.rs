@@ -25,7 +25,7 @@ pub struct BiasCfg {
     pub _full_spectrogram: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct BiasEstimate {
     pub bias_ms: f64,
     pub confidence: f64,
@@ -33,6 +33,7 @@ pub struct BiasEstimate {
     pub conv_stdev: f64,
 }
 
+#[derive(Debug, Clone)]
 pub struct BiasPlotData {
     pub freq_rows: usize,
     pub digest_rows: usize,
@@ -50,9 +51,68 @@ pub struct BiasPlotData {
     pub edge_discard: usize,
 }
 
+#[derive(Debug, Clone)]
 pub struct BiasEstimateWithPlot {
     pub estimate: BiasEstimate,
     pub plot: BiasPlotData,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphOrientation {
+    Vertical,
+    Horizontal,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BiasStreamCfg {
+    pub emit_freq_delta: bool,
+    pub orientation: GraphOrientation,
+}
+
+impl Default for BiasStreamCfg {
+    fn default() -> Self {
+        Self {
+            emit_freq_delta: false,
+            orientation: GraphOrientation::Vertical,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BiasStreamInit {
+    pub sample_rate_hz: u32,
+    pub cols: usize,
+    pub freq_rows: usize,
+    pub kernel_target: KernelTarget,
+    pub times_ms: Vec<f64>,
+    pub freqs_khz: Vec<f64>,
+    pub orientation: GraphOrientation,
+}
+
+#[derive(Debug, Clone)]
+pub struct BiasStreamBeat {
+    pub beat_seq: usize,
+    pub beat_index: usize,
+    pub beat_time_s: f64,
+    pub digest_row: Vec<f64>,
+    pub freq_delta: Option<Vec<f64>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BiasStreamConvolution {
+    pub rows: usize,
+    pub cols: usize,
+    pub post_kernel: Vec<f64>,
+    pub convolution: Vec<f64>,
+    pub edge_discard: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum BiasStreamEvent {
+    Init(BiasStreamInit),
+    Beat(BiasStreamBeat),
+    Convolution(BiasStreamConvolution),
+    Done(BiasEstimate),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -243,6 +303,11 @@ struct SpectrogramCacheEntry {
     ctx: SpectrogramCtx,
 }
 
+struct StreamSink<'a> {
+    cfg: BiasStreamCfg,
+    emit: &'a mut dyn FnMut(BiasStreamEvent),
+}
+
 impl TraceCollector {
     fn new(cfg: BiasTraceCfg) -> Self {
         Self {
@@ -334,6 +399,7 @@ pub fn estimate_bias_reuse(
         runtime,
         None,
         false,
+        None,
     )
     .map(BiasResult::into_estimate)
 }
@@ -360,6 +426,43 @@ pub fn estimate_bias_reuse_with_plot(
         runtime,
         None,
         true,
+        None,
+    )
+    .and_then(BiasResult::into_plot)
+}
+
+pub fn estimate_bias_reuse_with_stream<F>(
+    audio_mono: &[f32],
+    sample_rate_hz: u32,
+    chart: &rssp::ChartSummary,
+    cfg: &BiasCfg,
+    runtime: &mut BiasRuntime,
+    stream_cfg: BiasStreamCfg,
+    mut on_event: F,
+) -> Result<BiasEstimateWithPlot, String>
+where
+    F: FnMut(BiasStreamEvent),
+{
+    let setup = build_setup(audio_mono.len(), sample_rate_hz, cfg)?;
+    let timing = rssp::timing::timing_data_from_segments(
+        chart.chart_offset_seconds,
+        0.0,
+        &chart.timing_segments,
+    );
+    let mut sink = StreamSink {
+        cfg: stream_cfg,
+        emit: &mut on_event,
+    };
+    estimate_bias_with_timing_setup(
+        audio_mono,
+        sample_rate_hz,
+        &timing,
+        cfg,
+        setup,
+        runtime,
+        None,
+        true,
+        Some(&mut sink),
     )
     .and_then(BiasResult::into_plot)
 }
@@ -387,6 +490,7 @@ pub fn estimate_bias_reuse_with_trace(
         runtime,
         Some(trace_cfg),
         false,
+        None,
     )
     .and_then(BiasResult::into_pair)
 }
@@ -420,6 +524,7 @@ pub fn estimate_bias_with_timing_reuse(
         runtime,
         None,
         false,
+        None,
     )
     .map(BiasResult::into_estimate)
 }
@@ -457,6 +562,7 @@ where
         runtime,
         None,
         false,
+        None,
         beat_time_fn,
     )
     .map(BiasResult::into_estimate)
@@ -482,6 +588,7 @@ where
         runtime,
         Some(trace_cfg),
         false,
+        None,
         beat_time_fn,
     )
     .and_then(BiasResult::into_pair)
@@ -496,6 +603,7 @@ fn estimate_bias_with_timing_setup(
     runtime: &mut BiasRuntime,
     trace_cfg: Option<BiasTraceCfg>,
     want_plot: bool,
+    stream: Option<&mut StreamSink<'_>>,
 ) -> Result<BiasResult, String> {
     estimate_bias_with_setup(
         audio_mono,
@@ -505,6 +613,7 @@ fn estimate_bias_with_timing_setup(
         runtime,
         trace_cfg,
         want_plot,
+        stream,
         |beat| rssp::timing::get_time_for_beat(timing, beat as f64),
     )
 }
@@ -517,6 +626,7 @@ fn estimate_bias_with_setup<F>(
     runtime: &mut BiasRuntime,
     trace_cfg: Option<BiasTraceCfg>,
     want_plot: bool,
+    mut stream: Option<&mut StreamSink<'_>>,
     beat_time_fn: F,
 ) -> Result<BiasResult, String>
 where
@@ -534,6 +644,9 @@ where
     };
     let sp = runtime.spectrogram_ctx(key);
     let mut collector = trace_cfg.map(TraceCollector::new);
+    if let Some(s) = stream.as_deref_mut() {
+        emit_stream_init(s, sample_rate_hz, setup, cfg.kernel_target);
+    }
     let use_full_spectrogram = cfg._full_spectrogram
         && should_use_full_spectrogram(audio_mono.len(), setup, window_stats.windows.len());
     let (acc, digest, beats) = build_fingerprints(
@@ -544,6 +657,7 @@ where
         &window_stats.windows,
         sp,
         collector.as_mut(),
+        stream.as_deref_mut(),
     )?;
     let (rows, cols) = if cfg.kernel_target == KernelTarget::Accumulator {
         (setup.n_freq_taps, setup.fp_size)
@@ -558,6 +672,15 @@ where
     };
     let flat = flatten_columns_sum(&post, rows, cols);
     let conv_stats = estimate_from_convolution(&flat, setup.actual_step_sec, cfg.magic_offset_ms)?;
+    if let Some(s) = stream.as_deref_mut() {
+        (s.emit)(BiasStreamEvent::Convolution(BiasStreamConvolution {
+            rows,
+            cols,
+            post_kernel: post.clone(),
+            convolution: flat.clone(),
+            edge_discard: conv_stats.convolution.edge_discard,
+        }));
+    }
     let bias_ms = conv_stats.estimate.bias_ms;
     let edge_discard = conv_stats.convolution.edge_discard;
     if let Some(collector) = collector {
@@ -584,8 +707,14 @@ where
             convolution: conv_stats.convolution,
             result: conv_stats.result,
         };
+        if let Some(s) = stream.as_deref_mut() {
+            (s.emit)(BiasStreamEvent::Done(conv_stats.estimate));
+        }
         Ok(BiasResult::WithTrace(conv_stats.estimate, trace))
     } else if want_plot {
+        if let Some(s) = stream.as_deref_mut() {
+            (s.emit)(BiasStreamEvent::Done(conv_stats.estimate));
+        }
         Ok(BiasResult::WithPlot(BiasEstimateWithPlot {
             estimate: conv_stats.estimate,
             plot: build_plot_data(
@@ -602,6 +731,9 @@ where
             ),
         }))
     } else {
+        if let Some(s) = stream.as_deref_mut() {
+            (s.emit)(BiasStreamEvent::Done(conv_stats.estimate));
+        }
         Ok(BiasResult::Estimate(conv_stats.estimate))
     }
 }
@@ -636,6 +768,27 @@ fn build_setup(audio_len: usize, sample_rate_hz: u32, cfg: &BiasCfg) -> Result<S
         actual_step_sec,
         spectrogram_offset,
     })
+}
+
+fn emit_stream_init(
+    stream: &mut StreamSink<'_>,
+    sample_rate_hz: u32,
+    setup: Setup,
+    kernel_target: KernelTarget,
+) {
+    let hz_step = f64::from(sample_rate_hz) / setup.nperseg as f64;
+    let freqs_khz = (0..setup.n_freq_taps)
+        .map(|i| i as f64 * hz_step * 1e-3)
+        .collect::<Vec<_>>();
+    (stream.emit)(BiasStreamEvent::Init(BiasStreamInit {
+        sample_rate_hz,
+        cols: setup.fp_size,
+        freq_rows: setup.n_freq_taps,
+        kernel_target,
+        times_ms: fingerprint_times_ms(setup.fp_size, setup.actual_step_sec),
+        freqs_khz,
+        orientation: stream.cfg.orientation,
+    }));
 }
 
 fn beat_windows_from_fn<F>(
@@ -732,11 +885,28 @@ fn build_fingerprints(
     windows: &[BeatWindow],
     sp: &mut SpectrogramCtx,
     trace: Option<&mut TraceCollector>,
+    stream: Option<&mut StreamSink<'_>>,
 ) -> Result<(Vec<f64>, Vec<f64>, usize), String> {
     if use_full_spectrogram {
-        build_fingerprints_full(audio_mono, sample_rate_hz, setup, windows, sp, trace)
+        build_fingerprints_full(
+            audio_mono,
+            sample_rate_hz,
+            setup,
+            windows,
+            sp,
+            trace,
+            stream,
+        )
     } else {
-        build_fingerprints_legacy(audio_mono, sample_rate_hz, setup, windows, sp, trace)
+        build_fingerprints_legacy(
+            audio_mono,
+            sample_rate_hz,
+            setup,
+            windows,
+            sp,
+            trace,
+            stream,
+        )
     }
 }
 
@@ -765,6 +935,7 @@ fn build_fingerprints_full(
     windows: &[BeatWindow],
     sp: &mut SpectrogramCtx,
     mut trace: Option<&mut TraceCollector>,
+    mut stream: Option<&mut StreamSink<'_>>,
 ) -> Result<(Vec<f64>, Vec<f64>, usize), String> {
     let rows = setup.n_freq_taps;
     let cols = setup.fp_size;
@@ -783,6 +954,11 @@ fn build_fingerprints_full(
         if !window_matches_legacy_rules(audio_mono.len(), setup, w.t_s, w.t_f, cols, full_cols) {
             continue;
         }
+        let mut freq_delta = stream.as_ref().and_then(|s| {
+            s.cfg
+                .emit_freq_delta
+                .then(|| vec![0.0; rows.saturating_mul(cols)])
+        });
         digest_row.fill(0.0);
         apply_window_weighting(
             &sp.out,
@@ -793,9 +969,19 @@ fn build_fingerprints_full(
             w.t_s,
             &mut acc,
             &mut digest_row,
+            freq_delta.as_deref_mut(),
         );
         if let Some(rec) = trace.as_mut() {
             rec.push_beat(beat_trace(w, &digest_row, &fp_times_ms));
+        }
+        if let Some(sink) = stream.as_deref_mut() {
+            (sink.emit)(BiasStreamEvent::Beat(BiasStreamBeat {
+                beat_seq: beats,
+                beat_index: w.beat_index,
+                beat_time_s: w.beat_time_sec,
+                digest_row: digest_row.clone(),
+                freq_delta,
+            }));
         }
         digest.extend_from_slice(&digest_row);
         beats += 1;
@@ -814,6 +1000,7 @@ fn build_fingerprints_legacy(
     windows: &[BeatWindow],
     sp: &mut SpectrogramCtx,
     mut trace: Option<&mut TraceCollector>,
+    mut stream: Option<&mut StreamSink<'_>>,
 ) -> Result<(Vec<f64>, Vec<f64>, usize), String> {
     let rows = setup.n_freq_taps;
     let cols = setup.fp_size;
@@ -840,6 +1027,11 @@ fn build_fingerprints_legacy(
         ) {
             continue;
         }
+        let mut freq_delta = stream.as_ref().and_then(|s| {
+            s.cfg
+                .emit_freq_delta
+                .then(|| vec![0.0; rows.saturating_mul(cols)])
+        });
         digest_row.fill(0.0);
         apply_window_weighting(
             &sp.out,
@@ -850,9 +1042,19 @@ fn build_fingerprints_legacy(
             0,
             &mut acc,
             &mut digest_row,
+            freq_delta.as_deref_mut(),
         );
         if let Some(rec) = trace.as_mut() {
             rec.push_beat(beat_trace(w, &digest_row, &fp_times_ms));
+        }
+        if let Some(sink) = stream.as_deref_mut() {
+            (sink.emit)(BiasStreamEvent::Beat(BiasStreamBeat {
+                beat_seq: beats,
+                beat_index: w.beat_index,
+                beat_time_s: w.beat_time_sec,
+                digest_row: digest_row.clone(),
+                freq_delta,
+            }));
         }
         digest.extend_from_slice(&digest_row);
         beats += 1;
@@ -953,6 +1155,7 @@ fn apply_window_weighting(
     start_col: usize,
     acc: &mut [f64],
     digest_row: &mut [f64],
+    mut beat_delta: Option<&mut [f64]>,
 ) {
     for r in 0..rows {
         let w = weights[r];
@@ -962,6 +1165,9 @@ fn apply_window_weighting(
             let v = full_log_spec[src_off + c] * w;
             acc[dst_off + c] += v;
             digest_row[c] += v;
+            if let Some(delta) = beat_delta.as_deref_mut() {
+                delta[dst_off + c] = v;
+            }
         }
     }
 }
@@ -1286,8 +1492,9 @@ fn rivaling_strength(value: f64, median: f64, vmax: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BeatWindow, BiasCfg, BiasRuntime, Setup, SpectrogramCtx, build_fingerprints_full,
-        build_fingerprints_legacy, estimate_bias_with_beat_fn, estimate_bias_with_beat_fn_reuse,
+        BeatWindow, BiasCfg, BiasRuntime, BiasStreamCfg, BiasStreamEvent, Setup, SpectrogramCtx,
+        StreamSink, build_fingerprints_full, build_fingerprints_legacy, build_setup,
+        estimate_bias_with_beat_fn, estimate_bias_with_beat_fn_reuse, estimate_bias_with_setup,
         make_kernel, percentile,
     };
     use crate::model::{BiasKernel, KernelTarget};
@@ -1408,12 +1615,26 @@ mod tests {
         ];
         let mut sp_full = SpectrogramCtx::new(setup.nperseg);
         let mut sp_legacy = SpectrogramCtx::new(setup.nperseg);
-        let full =
-            build_fingerprints_full(&audio, sample_rate, setup, &windows, &mut sp_full, None)
-                .expect("full fingerprint build should succeed");
-        let legacy =
-            build_fingerprints_legacy(&audio, sample_rate, setup, &windows, &mut sp_legacy, None)
-                .expect("legacy fingerprint build should succeed");
+        let full = build_fingerprints_full(
+            &audio,
+            sample_rate,
+            setup,
+            &windows,
+            &mut sp_full,
+            None,
+            None,
+        )
+        .expect("full fingerprint build should succeed");
+        let legacy = build_fingerprints_legacy(
+            &audio,
+            sample_rate,
+            setup,
+            &windows,
+            &mut sp_legacy,
+            None,
+            None,
+        )
+        .expect("legacy fingerprint build should succeed");
         assert_eq!(full.2, legacy.2);
         assert_eq!(full.0.len(), legacy.0.len());
         assert_eq!(full.1.len(), legacy.1.len());
@@ -1423,5 +1644,50 @@ mod tests {
         for (a, b) in full.1.iter().zip(legacy.1.iter()) {
             assert!((*a - *b).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn stream_emits_incremental_events() {
+        let sample_rate = 4_000u32;
+        let len = (sample_rate as usize) * 4;
+        let mut audio = Vec::with_capacity(len);
+        for i in 0..len {
+            let t = i as f32 * 0.03;
+            audio.push((t.sin() * (t * 0.25).cos()) * 0.7);
+        }
+        let cfg = bias_cfg();
+        let setup = build_setup(audio.len(), sample_rate, &cfg).expect("setup should be valid");
+        let mut runtime = BiasRuntime::default();
+        let mut events = Vec::new();
+        {
+            let mut on_event = |ev| events.push(ev);
+            let mut sink = StreamSink {
+                cfg: BiasStreamCfg::default(),
+                emit: &mut on_event,
+            };
+            let out = estimate_bias_with_setup(
+                &audio,
+                sample_rate,
+                &cfg,
+                setup,
+                &mut runtime,
+                None,
+                true,
+                Some(&mut sink),
+                |beat| beat as f64 * 0.25,
+            )
+            .expect("streamed estimate should succeed")
+            .into_plot()
+            .expect("streamed estimate should include plot");
+            assert!(out.plot.cols > 0);
+        }
+        assert!(matches!(events.first(), Some(BiasStreamEvent::Init(_))));
+        assert!(events.iter().any(|e| matches!(e, BiasStreamEvent::Beat(_))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, BiasStreamEvent::Convolution(_)))
+        );
+        assert!(matches!(events.last(), Some(BiasStreamEvent::Done(_))));
     }
 }

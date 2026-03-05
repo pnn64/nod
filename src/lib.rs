@@ -1,3 +1,5 @@
+pub mod api;
+
 mod analyze;
 mod audio;
 mod bench;
@@ -65,4 +67,9 @@ fn write_json<T: Serialize>(value: &T, out_path: Option<&Path>) -> Result<(), St
     }
 }
 
+pub use bias::{
+    BiasCfg, BiasEstimate, BiasEstimateWithPlot, BiasPlotData, BiasRuntime, BiasStreamCfg,
+    BiasStreamEvent, GraphOrientation,
+};
 pub use compat::{guess_paradigm, slot_abbreviation, slot_expansion};
+pub use model::{BiasKernel, KernelTarget};
