@@ -100,14 +100,91 @@ fn case_error(simfile_rel: String, status: &str, error: String) -> ParityCase {
     }
 }
 
+struct CompareOutcome {
+    mismatches: Vec<String>,
+    #[cfg(test)]
+    logs: Vec<String>,
+}
+
+struct CompareState {
+    verbose: bool,
+    mismatches: Vec<String>,
+    logs: Vec<String>,
+}
+
+impl CompareState {
+    fn new(verbose: bool) -> Self {
+        Self {
+            verbose,
+            mismatches: Vec::new(),
+            logs: Vec::new(),
+        }
+    }
+
+    fn note(&mut self, msg: String) {
+        if self.verbose {
+            self.logs.push(msg);
+        }
+    }
+
+    fn check(&mut self, display: String, ok: bool, mismatch: String) {
+        if self.verbose {
+            let status = if ok { "....ok" } else { "....MISMATCH" };
+            self.logs.push(format!("{display} {status}"));
+        }
+        if !ok {
+            self.mismatches.push(mismatch);
+        }
+    }
+
+    fn mismatch(&mut self, mismatch: String) {
+        self.check(mismatch.clone(), false, mismatch);
+    }
+
+    fn finish(self) -> CompareOutcome {
+        CompareOutcome {
+            mismatches: self.mismatches,
+            #[cfg(test)]
+            logs: self.logs,
+        }
+    }
+}
+
 fn compare_baseline(
     simfile_path: &Path,
     simfile_bytes: &[u8],
     baseline: &BaselineFixture,
 ) -> Result<Option<String>, String> {
-    if baseline.charts.is_empty() {
-        return Ok(None);
+    let outcome = compare_baseline_inner(simfile_path, simfile_bytes, baseline, false)?;
+    if outcome.mismatches.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(outcome.mismatches.join("; ")))
     }
+}
+
+#[cfg(test)]
+fn compare_baseline_verbose(
+    simfile_path: &Path,
+    simfile_bytes: &[u8],
+    baseline: &BaselineFixture,
+) -> Result<CompareOutcome, String> {
+    compare_baseline_inner(simfile_path, simfile_bytes, baseline, true)
+}
+
+fn compare_baseline_inner(
+    simfile_path: &Path,
+    simfile_bytes: &[u8],
+    baseline: &BaselineFixture,
+    verbose: bool,
+) -> Result<CompareOutcome, String> {
+    if baseline.charts.is_empty() {
+        let mut state = CompareState::new(verbose);
+        state.note("  no chart rows in baseline; skipping".to_string());
+        return Ok(state.finish());
+    }
+    let mut state = CompareState::new(verbose);
+    state.note(format!("analyzing {}", simfile_path.display()));
     let ext = simfile_ext(simfile_path);
     let summary = analyze(simfile_bytes, &ext, &AnalysisOptions::default())
         .map_err(|e| format!("rssp analyze failed: {e}"))?;
@@ -119,23 +196,12 @@ fn compare_baseline(
         )
     })?;
     let mut cache = Vec::new();
-    let mut mismatches = Vec::new();
     for row in &baseline.charts {
         compare_row(
-            row,
-            baseline,
-            &summary,
-            song_dir,
-            &cfg,
-            &mut cache,
-            &mut mismatches,
+            row, baseline, &summary, song_dir, &cfg, &mut cache, &mut state,
         )?;
     }
-    if mismatches.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(mismatches.join("; ")))
-    }
+    Ok(state.finish())
 }
 
 fn compare_row(
@@ -145,18 +211,19 @@ fn compare_row(
     song_dir: &Path,
     cfg: &BiasCfg,
     cache: &mut Vec<AudioCacheEntry>,
-    mismatches: &mut Vec<String>,
+    state: &mut CompareState,
 ) -> Result<(), String> {
+    state.note(format!("  {}", chart_label(row)));
     let Some(chart) = chart_for_row(summary, row.chart_index) else {
-        mismatches.push(format!("{} missing in simfile summary", chart_label(row)));
+        state.mismatch(format!("{} missing in simfile summary", chart_label(row)));
         return Ok(());
     };
-    compare_row_meta(row, chart, mismatches);
+    compare_row_meta(row, chart, state);
     if !row_needs_audio(row) {
         return Ok(());
     }
     let Some(music_tag) = chart_music_tag(row, &baseline.music, None, &summary.music_path) else {
-        mismatches.push(format!("{} missing music tag", chart_label(row)));
+        state.mismatch(format!("{} missing music tag", chart_label(row)));
         return Ok(());
     };
     let Some(audio_path) = rssp::assets::resolve_music_path_like_itg(song_dir, music_tag) else {
@@ -175,60 +242,63 @@ fn compare_row(
     }
     let decode = decode_cached(&audio_path, cache)
         .map_err(|e| format!("{} audio decode failed: {e}", chart_label(row)))?;
-    compare_sample_rate(row, decode.sample_rate_hz, mismatches);
+    compare_sample_rate(row, decode.sample_rate_hz, state);
     if !row_has_bias_fields(row) {
         return Ok(());
     }
     let est = estimate_bias(&decode.mono, decode.sample_rate_hz, chart, cfg)
         .map_err(|e| format!("{} bias estimation failed: {e}", chart_label(row)))?;
-    compare_row_fields(row, baseline, chart, &est, mismatches);
+    compare_row_fields(row, baseline, chart, &est, state);
     Ok(())
 }
 
-fn compare_row_meta(row: &BaselineChart, chart: &rssp::ChartSummary, mismatches: &mut Vec<String>) {
+fn compare_row_meta(row: &BaselineChart, chart: &rssp::ChartSummary, state: &mut CompareState) {
     compare_opt_text(
         row,
         "steps_type",
         row.steps_type.as_deref(),
         Some(chart.step_type_str.as_str()),
-        mismatches,
+        state,
     );
     compare_opt_text(
         row,
         "difficulty",
         row.difficulty.as_deref(),
         Some(chart.difficulty_str.as_str()),
-        mismatches,
+        state,
     );
     compare_opt_text(
         row,
         "description",
         row.description.as_deref(),
         Some(chart.description_str.as_str()),
-        mismatches,
+        state,
     );
-    if let Some(base) = row.chart_has_own_timing
-        && base != chart.chart_has_own_timing
-    {
-        mismatches.push(format!(
-            "{}.chart_has_own_timing mismatch: baseline={base} expected={}",
-            chart_label(row),
-            chart.chart_has_own_timing
-        ));
+    if let Some(base) = row.chart_has_own_timing {
+        let expected = chart.chart_has_own_timing;
+        let display = format!(
+            "    {}.chart_has_own_timing: baseline={base} expected={expected}",
+            chart_label(row)
+        );
+        let mismatch = format!(
+            "{}.chart_has_own_timing mismatch: baseline={base} expected={expected}",
+            chart_label(row)
+        );
+        state.check(display, base == expected, mismatch);
     }
     compare_opt_text(
         row,
         "slot_null",
         row.slot_null.as_deref(),
         Some(expected_slot_value(row, chart, "null").as_str()),
-        mismatches,
+        state,
     );
     compare_opt_text(
         row,
         "slot_p9ms",
         row.slot_p9ms.as_deref(),
         Some(expected_slot_value(row, chart, "+9ms").as_str()),
-        mismatches,
+        state,
     );
 }
 
@@ -237,23 +307,16 @@ fn compare_row_fields(
     baseline: &BaselineFixture,
     chart: &rssp::ChartSummary,
     est: &crate::bias::BiasEstimate,
-    mismatches: &mut Vec<String>,
+    state: &mut CompareState,
 ) {
-    compare_float(
-        row,
-        "bias_ms",
-        row.bias_ms,
-        est.bias_ms,
-        BIAS_MS_TOL,
-        mismatches,
-    );
+    compare_float(row, "bias_ms", row.bias_ms, est.bias_ms, BIAS_MS_TOL, state);
     compare_float(
         row,
         "confidence",
         row.confidence,
         est.confidence,
         CONF_TOL,
-        mismatches,
+        state,
     );
     compare_float(
         row,
@@ -261,7 +324,7 @@ fn compare_row_fields(
         row.conv_quint,
         est.conv_quint,
         CONV_TOL,
-        mismatches,
+        state,
     );
     compare_float(
         row,
@@ -269,7 +332,7 @@ fn compare_row_fields(
         row.conv_stdev,
         est.conv_stdev,
         CONV_TOL,
-        mismatches,
+        state,
     );
     let expected_paradigm = guess_paradigm(
         est.bias_ms,
@@ -279,32 +342,40 @@ fn compare_row_fields(
         true,
     );
     if let Some(base) = normalize_opt_text(row.paradigm.as_deref()) {
-        if base != expected_paradigm {
-            mismatches.push(format!(
-                "{}.paradigm mismatch: baseline={:?} expected={:?}",
-                chart_label(row),
-                base,
-                expected_paradigm
-            ));
-        }
+        let display = format!(
+            "    {}.paradigm: baseline={:?} expected={:?}",
+            chart_label(row),
+            base,
+            expected_paradigm
+        );
+        let mismatch = format!(
+            "{}.paradigm mismatch: baseline={:?} expected={:?}",
+            chart_label(row),
+            base,
+            expected_paradigm
+        );
+        state.check(display, base == expected_paradigm, mismatch);
     }
     compare_opt_text(
         row,
         "slot",
         row.slot.as_deref(),
         Some(expected_slot_value(row, chart, expected_paradigm).as_str()),
-        mismatches,
+        state,
     );
 }
 
-fn compare_sample_rate(row: &BaselineChart, expected: u32, mismatches: &mut Vec<String>) {
+fn compare_sample_rate(row: &BaselineChart, expected: u32, state: &mut CompareState) {
     let Some(base) = row.sample_rate else { return };
-    if base != expected {
-        mismatches.push(format!(
-            "{}.sample_rate mismatch: baseline={base} expected={expected}",
-            chart_label(row)
-        ));
-    }
+    let display = format!(
+        "    {}.sample_rate: baseline={base} expected={expected}",
+        chart_label(row)
+    );
+    let mismatch = format!(
+        "{}.sample_rate mismatch: baseline={base} expected={expected}",
+        chart_label(row)
+    );
+    state.check(display, base == expected, mismatch);
 }
 
 fn compare_opt_text(
@@ -312,20 +383,25 @@ fn compare_opt_text(
     field: &str,
     baseline: Option<&str>,
     expected: Option<&str>,
-    mismatches: &mut Vec<String>,
+    state: &mut CompareState,
 ) {
     let Some(base) = normalize_opt_text(baseline) else {
         return;
     };
     let expect = expected.and_then(non_empty_trim).unwrap_or("");
-    if base != expect {
-        mismatches.push(format!(
-            "{}.{field} mismatch: baseline={:?} expected={:?}",
-            chart_label(row),
-            base,
-            expect
-        ));
-    }
+    let display = format!(
+        "    {}.{field}: baseline={:?} expected={:?}",
+        chart_label(row),
+        base,
+        expect
+    );
+    let mismatch = format!(
+        "{}.{field} mismatch: baseline={:?} expected={:?}",
+        chart_label(row),
+        base,
+        expect
+    );
+    state.check(display, base == expect, mismatch);
 }
 
 fn expected_slot_value(row: &BaselineChart, chart: &rssp::ChartSummary, paradigm: &str) -> String {
@@ -350,15 +426,19 @@ fn compare_float(
     baseline: Option<f64>,
     expected: f64,
     tol: f64,
-    mismatches: &mut Vec<String>,
+    state: &mut CompareState,
 ) {
     let Some(base) = baseline else { return };
-    if (base - expected).abs() > tol {
-        mismatches.push(format!(
-            "{}.{field} mismatch: baseline={base:.6} expected={expected:.6} tolerance={tol:.6}",
-            chart_label(row)
-        ));
-    }
+    let ok = (base - expected).abs() <= tol;
+    let display = format!(
+        "    {}.{field}: baseline={base:.6} expected={expected:.6} tolerance={tol:.6}",
+        chart_label(row)
+    );
+    let mismatch = format!(
+        "{}.{field} mismatch: baseline={base:.6} expected={expected:.6} tolerance={tol:.6}",
+        chart_label(row)
+    );
+    state.check(display, ok, mismatch);
 }
 
 fn row_has_bias_fields(row: &BaselineChart) -> bool {
@@ -535,6 +615,9 @@ fn simfile_ext(path: &Path) -> String {
 
 #[derive(Debug, Deserialize)]
 struct BaselineFixture {
+    #[cfg(test)]
+    #[serde(default)]
+    simfile_path: Option<String>,
     #[serde(default)]
     music: String,
     #[serde(default)]
@@ -663,8 +746,12 @@ mod tests {
     use crate::audio::OggDecode;
     use crate::cli::ParityCmd;
     use crate::fs_scan::md5_hex;
+    use walkdir::WalkDir;
 
-    use super::{BaselineChart, chart_music_tag, decode_cached_with, run};
+    use super::{
+        BaselineChart, chart_music_tag, compare_baseline_verbose, decode_cached_with,
+        non_empty_trim, parse_baseline, read_baseline, run,
+    };
 
     #[test]
     fn parity_matches_existing_baseline_file() {
@@ -830,6 +917,112 @@ mod tests {
         assert_eq!(report.total_simfiles, 1);
         assert_eq!(report.mismatched, 1);
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    #[ignore = "slow parity sweep over all baseline fixtures; requires local simfile paths to exist"]
+    fn parity_matches_all_available_baselines() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let baseline_root = manifest_dir.join("tests/baseline");
+        assert!(
+            baseline_root.exists(),
+            "baseline directory missing: {}",
+            baseline_root.display()
+        );
+
+        let mut fixtures = WalkDir::new(&baseline_root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .map(|entry| entry.into_path())
+            .filter(|path| is_baseline_fixture(path))
+            .collect::<Vec<_>>();
+        fixtures.sort();
+
+        let mut checked = 0usize;
+        let mut skipped = 0usize;
+        let mut failed = Vec::new();
+        for fixture_path in fixtures {
+            let rel = fixture_path
+                .strip_prefix(&baseline_root)
+                .unwrap_or(&fixture_path)
+                .display()
+                .to_string();
+            let baseline = match read_baseline(&fixture_path).and_then(parse_baseline) {
+                Ok(v) => v,
+                Err(err) => {
+                    failed.push(format!("{rel}: parse failed: {err}"));
+                    continue;
+                }
+            };
+            let Some(simfile_raw) = baseline.simfile_path.as_deref().and_then(non_empty_trim)
+            else {
+                skipped += 1;
+                continue;
+            };
+            let simfile_path = PathBuf::from(simfile_raw);
+            if !simfile_path.exists() {
+                skipped += 1;
+                continue;
+            }
+            let simfile_bytes = match fs::read(&simfile_path) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    failed.push(format!("{rel}: read simfile failed: {err}"));
+                    continue;
+                }
+            };
+            checked += 1;
+            match compare_baseline_verbose(&simfile_path, &simfile_bytes, &baseline) {
+                Ok(outcome) => {
+                    for line in outcome.logs {
+                        println!("{line}");
+                    }
+                    if outcome.mismatches.is_empty() {
+                        println!("  result: ....ok");
+                    } else {
+                        println!("  result: ....MISMATCH");
+                        for msg in &outcome.mismatches {
+                            println!("    {msg}");
+                        }
+                        failed.push(format!(
+                            "{rel}: mismatch: {}",
+                            outcome.mismatches.join("; ")
+                        ));
+                    }
+                }
+                Err(err) => failed.push(format!("{rel}: compare failed: {err}")),
+            }
+        }
+
+        println!(
+            "baseline parity sweep: checked={checked} skipped={skipped} failed={}",
+            failed.len()
+        );
+        assert!(
+            checked > 0,
+            "no baseline fixtures could be checked; ensure baseline simfile_path values exist locally"
+        );
+        assert!(
+            failed.is_empty(),
+            "baseline parity sweep failures (showing up to 20):\n{}",
+            failed.into_iter().take(20).collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    fn is_baseline_fixture(path: &Path) -> bool {
+        if !path.is_file() {
+            return false;
+        }
+        if path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zst"))
+        {
+            return true;
+        }
+        path.extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
     }
 
     fn temp_root(tag: &str) -> PathBuf {
