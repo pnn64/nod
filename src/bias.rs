@@ -44,7 +44,67 @@ pub fn estimate_bias(
     cfg: &BiasCfg,
 ) -> Result<BiasEstimate, String> {
     let setup = build_setup(audio_mono.len(), sample_rate_hz, cfg)?;
-    let windows = beat_windows(chart, audio_mono.len(), sample_rate_hz, cfg, setup);
+    let timing = rssp::timing::timing_data_from_segments(
+        chart.chart_offset_seconds,
+        0.0,
+        &chart.timing_segments,
+    );
+    estimate_bias_with_timing_setup(audio_mono, sample_rate_hz, &timing, cfg, setup)
+}
+
+#[allow(dead_code)]
+pub fn estimate_bias_with_timing(
+    audio_mono: &[f32],
+    sample_rate_hz: u32,
+    timing: &rssp::timing::TimingData,
+    cfg: &BiasCfg,
+) -> Result<BiasEstimate, String> {
+    let setup = build_setup(audio_mono.len(), sample_rate_hz, cfg)?;
+    estimate_bias_with_timing_setup(audio_mono, sample_rate_hz, timing, cfg, setup)
+}
+
+pub fn estimate_bias_with_beat_fn<F>(
+    audio_mono: &[f32],
+    sample_rate_hz: u32,
+    cfg: &BiasCfg,
+    beat_time_fn: F,
+) -> Result<BiasEstimate, String>
+where
+    F: FnMut(usize) -> f64,
+{
+    let setup = build_setup(audio_mono.len(), sample_rate_hz, cfg)?;
+    estimate_bias_with_setup(audio_mono, sample_rate_hz, cfg, setup, beat_time_fn)
+}
+
+fn estimate_bias_with_timing_setup(
+    audio_mono: &[f32],
+    sample_rate_hz: u32,
+    timing: &rssp::timing::TimingData,
+    cfg: &BiasCfg,
+    setup: Setup,
+) -> Result<BiasEstimate, String> {
+    estimate_bias_with_setup(audio_mono, sample_rate_hz, cfg, setup, |beat| {
+        rssp::timing::get_time_for_beat(timing, beat as f64)
+    })
+}
+
+fn estimate_bias_with_setup<F>(
+    audio_mono: &[f32],
+    sample_rate_hz: u32,
+    cfg: &BiasCfg,
+    setup: Setup,
+    beat_time_fn: F,
+) -> Result<BiasEstimate, String>
+where
+    F: FnMut(usize) -> f64,
+{
+    let windows = beat_windows_from_fn(
+        audio_mono.len(),
+        sample_rate_hz,
+        cfg,
+        setup,
+        beat_time_fn,
+    );
     if windows.is_empty() {
         return Err("no beat windows produced for bias calculation".to_string());
     }
@@ -73,7 +133,7 @@ fn build_setup(audio_len: usize, sample_rate_hz: u32, cfg: &BiasCfg) -> Result<S
         return Err("audio too short for spectrogram window".to_string());
     }
     let actual_step_sec = nstep as f64 / f64::from(sample_rate_hz);
-    let fp_size = 2 * ((cfg.fingerprint_ms * 1e-3 / actual_step_sec).round() as usize);
+    let fp_size = 2 * (py_round(cfg.fingerprint_ms * 1e-3 / actual_step_sec) as usize);
     if fp_size < 8 {
         return Err("fingerprint size is too small".to_string());
     }
@@ -92,25 +152,23 @@ fn build_setup(audio_len: usize, sample_rate_hz: u32, cfg: &BiasCfg) -> Result<S
     })
 }
 
-fn beat_windows(
-    chart: &rssp::ChartSummary,
+fn beat_windows_from_fn<F>(
     audio_len: usize,
     sample_rate_hz: u32,
     cfg: &BiasCfg,
     setup: Setup,
-) -> Vec<(usize, usize)> {
-    let timing = rssp::timing::timing_data_from_segments(
-        chart.chart_offset_seconds,
-        0.0,
-        &chart.timing_segments,
-    );
+    mut beat_time_fn: F,
+) -> Vec<(usize, usize)>
+where
+    F: FnMut(usize) -> f64,
+{
     let audio_duration_sec = audio_len as f64 / f64::from(sample_rate_hz);
     let min_sep_sec = cfg.fingerprint_ms * 1e-3;
     let mut windows = Vec::new();
     let mut t_last = f64::NEG_INFINITY;
     let mut beat = 0usize;
     while beat < 200_000 {
-        let t = rssp::timing::get_time_for_beat(&timing, beat as f64);
+        let t = beat_time_fn(beat);
         beat += 1;
         if !t.is_finite() {
             break;
@@ -134,10 +192,8 @@ fn beat_windows(
 
 fn beat_time_to_window_taps(beat_time: f64, setup: Setup) -> Option<(usize, usize)> {
     let half = setup.fp_size as f64 * 0.5;
-    let t_s =
-        (beat_time / setup.actual_step_sec - setup.spectrogram_offset - half).round() as isize;
-    let t_f =
-        (beat_time / setup.actual_step_sec - setup.spectrogram_offset + half).round() as isize;
+    let t_s = py_round(beat_time / setup.actual_step_sec - setup.spectrogram_offset - half);
+    let t_f = py_round(beat_time / setup.actual_step_sec - setup.spectrogram_offset + half);
     let start = t_s.max(0);
     let end = t_f.min(setup.n_time_taps);
     if end - start != setup.fp_size as isize {
@@ -349,6 +405,11 @@ fn fingerprint_times_ms(cols: usize, actual_step_sec: f64) -> Vec<f64> {
     (0..cols)
         .map(|i| (i as isize - half) as f64 * step_ms)
         .collect()
+}
+
+#[inline]
+fn py_round(v: f64) -> isize {
+    v.round_ties_even() as isize
 }
 
 fn argmax(values: &[f64]) -> usize {

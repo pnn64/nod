@@ -6,7 +6,7 @@ use rssp::{AnalysisOptions, analyze};
 use serde::Deserialize;
 
 use crate::audio::{OggDecode, decode_ogg_mono_like_python};
-use crate::bias::{BiasCfg, estimate_bias};
+use crate::bias::{BiasCfg, estimate_bias_with_beat_fn};
 use crate::cli::ParityCmd;
 use crate::compat::{guess_paradigm, slot_abbreviation};
 use crate::fs_scan::{baseline_rel_for_md5, discover_simfiles, md5_hex, rel_path};
@@ -189,6 +189,7 @@ fn compare_baseline_inner(
     let summary = analyze(simfile_bytes, &ext, &AnalysisOptions::default())
         .map_err(|e| format!("rssp analyze failed: {e}"))?;
     let cfg = bias_cfg_from_params(&baseline.params)?;
+    let global_timing = global_timing_data(&summary)?;
     let song_dir = simfile_path.parent().ok_or_else(|| {
         format!(
             "simfile has no parent directory: {}",
@@ -198,7 +199,14 @@ fn compare_baseline_inner(
     let mut cache = Vec::new();
     for row in &baseline.charts {
         compare_row(
-            row, baseline, &summary, song_dir, &cfg, &mut cache, &mut state,
+            row,
+            baseline,
+            &summary,
+            &global_timing,
+            song_dir,
+            &cfg,
+            &mut cache,
+            &mut state,
         )?;
     }
     Ok(state.finish())
@@ -208,12 +216,54 @@ fn compare_row(
     row: &BaselineChart,
     baseline: &BaselineFixture,
     summary: &rssp::SimfileSummary,
+    global_timing: &PyTimingEngine,
     song_dir: &Path,
     cfg: &BiasCfg,
     cache: &mut Vec<AudioCacheEntry>,
     state: &mut CompareState,
 ) -> Result<(), String> {
     state.note(format!("  {}", chart_label(row)));
+    if row.chart_index.is_none() {
+        compare_base_row_meta(row, state);
+        if !row_needs_audio(row) {
+            return Ok(());
+        }
+        let Some(music_tag) = chart_music_tag(row, &baseline.music, None, &summary.music_path)
+        else {
+            state.mismatch(format!("{} missing music tag", chart_label(row)));
+            return Ok(());
+        };
+        let Some(audio_path) = rssp::assets::resolve_music_path_like_itg(song_dir, music_tag)
+        else {
+            return Err(format!(
+                "{} unresolved #MUSIC {:?}",
+                chart_label(row),
+                music_tag
+            ));
+        };
+        if !is_ogg_path(&audio_path) {
+            return Err(format!(
+                "{} unsupported audio format {}",
+                chart_label(row),
+                audio_path.display()
+            ));
+        }
+        let decode = decode_cached(&audio_path, cache)
+            .map_err(|e| format!("{} audio decode failed: {e}", chart_label(row)))?;
+        compare_sample_rate(row, decode.sample_rate_hz, state);
+        if !row_has_bias_fields(row) {
+            return Ok(());
+        }
+        let est = estimate_bias_with_beat_fn(
+            &decode.mono,
+            decode.sample_rate_hz,
+            cfg,
+            |beat| global_timing.time_at_stop(beat as f64),
+        )
+        .map_err(|e| format!("{} bias estimation failed: {e}", chart_label(row)))?;
+        compare_base_row_fields(row, baseline, &est, state);
+        return Ok(());
+    }
     let Some(chart) = chart_for_row(summary, row.chart_index) else {
         state.mismatch(format!("{} missing in simfile summary", chart_label(row)));
         return Ok(());
@@ -246,8 +296,11 @@ fn compare_row(
     if !row_has_bias_fields(row) {
         return Ok(());
     }
-    let est = estimate_bias(&decode.mono, decode.sample_rate_hz, chart, cfg)
-        .map_err(|e| format!("{} bias estimation failed: {e}", chart_label(row)))?;
+    let timing = chart_timing_data(summary, chart, global_timing)?;
+    let est = estimate_bias_with_beat_fn(&decode.mono, decode.sample_rate_hz, cfg, |beat| {
+        timing.time_at_stop(beat as f64)
+    })
+    .map_err(|e| format!("{} bias estimation failed: {e}", chart_label(row)))?;
     compare_row_fields(row, baseline, chart, &est, state);
     Ok(())
 }
@@ -300,6 +353,23 @@ fn compare_row_meta(row: &BaselineChart, chart: &rssp::ChartSummary, state: &mut
         Some(expected_slot_value(row, chart, "+9ms").as_str()),
         state,
     );
+}
+
+fn compare_base_row_meta(row: &BaselineChart, state: &mut CompareState) {
+    if let Some(base) = row.chart_has_own_timing {
+        let expected = false;
+        let display = format!(
+            "    {}.chart_has_own_timing: baseline={base} expected={expected}",
+            chart_label(row)
+        );
+        let mismatch = format!(
+            "{}.chart_has_own_timing mismatch: baseline={base} expected={expected}",
+            chart_label(row)
+        );
+        state.check(display, base == expected, mismatch);
+    }
+    compare_opt_text(row, "slot_null", row.slot_null.as_deref(), Some("*"), state);
+    compare_opt_text(row, "slot_p9ms", row.slot_p9ms.as_deref(), Some("*"), state);
 }
 
 fn compare_row_fields(
@@ -363,6 +433,62 @@ fn compare_row_fields(
         Some(expected_slot_value(row, chart, expected_paradigm).as_str()),
         state,
     );
+}
+
+fn compare_base_row_fields(
+    row: &BaselineChart,
+    baseline: &BaselineFixture,
+    est: &crate::bias::BiasEstimate,
+    state: &mut CompareState,
+) {
+    compare_float(row, "bias_ms", row.bias_ms, est.bias_ms, BIAS_MS_TOL, state);
+    compare_float(
+        row,
+        "confidence",
+        row.confidence,
+        est.confidence,
+        CONF_TOL,
+        state,
+    );
+    compare_float(
+        row,
+        "conv_quint",
+        row.conv_quint,
+        est.conv_quint,
+        CONV_TOL,
+        state,
+    );
+    compare_float(
+        row,
+        "conv_stdev",
+        row.conv_stdev,
+        est.conv_stdev,
+        CONV_TOL,
+        state,
+    );
+    let expected_paradigm = guess_paradigm(
+        est.bias_ms,
+        baseline.params.tolerance,
+        baseline.params.consider_null,
+        baseline.params.consider_p9ms,
+        true,
+    );
+    if let Some(base) = normalize_opt_text(row.paradigm.as_deref()) {
+        let display = format!(
+            "    {}.paradigm: baseline={:?} expected={:?}",
+            chart_label(row),
+            base,
+            expected_paradigm
+        );
+        let mismatch = format!(
+            "{}.paradigm mismatch: baseline={:?} expected={:?}",
+            chart_label(row),
+            base,
+            expected_paradigm
+        );
+        state.check(display, base == expected_paradigm, mismatch);
+    }
+    compare_opt_text(row, "slot", row.slot.as_deref(), Some("*"), state);
 }
 
 fn compare_sample_rate(row: &BaselineChart, expected: u32, state: &mut CompareState) {
@@ -533,6 +659,299 @@ fn bias_cfg_from_params(params: &BaselineParams) -> Result<BiasCfg, String> {
         kernel_type: parse_kernel_type(&params.kernel_type)?,
         _full_spectrogram: params.full_spectrogram,
     })
+}
+
+fn global_timing_data(summary: &rssp::SimfileSummary) -> Result<PyTimingEngine, String> {
+    PyTimingEngine::from_maps(
+        summary.offset,
+        &summary.normalized_bpms,
+        &summary.normalized_stops,
+        &summary.normalized_delays,
+        &summary.normalized_warps,
+    )
+}
+
+fn chart_timing_data(
+    summary: &rssp::SimfileSummary,
+    chart: &rssp::ChartSummary,
+    global: &PyTimingEngine,
+) -> Result<PyTimingEngine, String> {
+    if !python_uses_chart_timing(summary, chart) {
+        return Ok(global.clone());
+    }
+    let chart_offset = if (chart.chart_offset_seconds - summary.offset).abs() > 1e-12 {
+        chart.chart_offset_seconds
+    } else {
+        0.0
+    };
+    PyTimingEngine::from_maps(
+        chart_offset,
+        chart.chart_bpms.as_deref().unwrap_or(""),
+        chart.chart_stops.as_deref().unwrap_or(""),
+        chart.chart_delays.as_deref().unwrap_or(""),
+        chart.chart_warps.as_deref().unwrap_or(""),
+    )
+}
+
+fn python_uses_chart_timing(summary: &rssp::SimfileSummary, chart: &rssp::ChartSummary) -> bool {
+    summary.timing_format == rssp::timing::TimingFormat::Ssc
+        && summary.ssc_version >= 0.7
+        && chart_has_timing_props(chart)
+}
+
+fn chart_has_timing_props(chart: &rssp::ChartSummary) -> bool {
+    opt_has_text(chart.chart_bpms.as_deref())
+        || opt_has_text(chart.chart_stops.as_deref())
+        || opt_has_text(chart.chart_delays.as_deref())
+        || opt_has_text(chart.chart_time_signatures.as_deref())
+        || opt_has_text(chart.chart_tickcounts.as_deref())
+        || opt_has_text(chart.chart_combos.as_deref())
+        || opt_has_text(chart.chart_warps.as_deref())
+        || opt_has_text(chart.chart_speeds.as_deref())
+        || opt_has_text(chart.chart_scrolls.as_deref())
+        || opt_has_text(chart.chart_fakes.as_deref())
+        || opt_has_text(chart.chart_labels.as_deref())
+}
+
+fn opt_has_text(value: Option<&str>) -> bool {
+    value.is_some_and(|s| !s.trim().is_empty())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PyEventTag {
+    Warp = 0,
+    WarpEnd = 1,
+    Bpm = 2,
+    Delay = 3,
+    DelayEnd = 4,
+    Stop = 5,
+    StopEnd = 6,
+}
+
+#[derive(Clone, Copy)]
+struct PyEvent {
+    beat: f64,
+    value: f64,
+    tag: PyEventTag,
+    seq: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PyTimingState {
+    beat: f64,
+    value: f64,
+    tag: PyEventTag,
+    time: f64,
+    bpm: f64,
+    warp: bool,
+}
+
+#[derive(Clone)]
+struct PyTimingEngine {
+    states: Vec<PyTimingState>,
+}
+
+impl PyTimingEngine {
+    fn from_maps(
+        offset_sec: f64,
+        bpms_raw: &str,
+        stops_raw: &str,
+        delays_raw: &str,
+        warps_raw: &str,
+    ) -> Result<Self, String> {
+        let mut bpms = parse_beat_values(bpms_raw);
+        if bpms.is_empty() {
+            return Err("timing parse failed: empty BPMS".to_string());
+        }
+        bpms.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let first_bpm = bpms[0];
+        if first_bpm.0 != 0.0 {
+            return Err(format!(
+                "timing parse failed: first BPM must be at beat 0, got {}",
+                first_bpm.0
+            ));
+        }
+
+        let mut stops = parse_beat_values(stops_raw);
+        let mut delays = parse_beat_values(delays_raw);
+        let mut warps = parse_beat_values(warps_raw);
+        stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+        delays.sort_by(|a, b| a.0.total_cmp(&b.0));
+        warps.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let warp_ranges = coalesce_warps(&warps);
+
+        let mut seq = 0usize;
+        let mut events = Vec::with_capacity(
+            bpms.len().saturating_sub(1)
+                + stops.len() * 2
+                + delays.len() * 2
+                + warp_ranges.len() * 2,
+        );
+        for (beat, bpm) in bpms.into_iter().skip(1) {
+            events.push(PyEvent {
+                beat,
+                value: bpm,
+                tag: PyEventTag::Bpm,
+                seq,
+            });
+            seq += 1;
+        }
+        for (beat, value) in delays {
+            events.push(PyEvent {
+                beat,
+                value,
+                tag: PyEventTag::Delay,
+                seq,
+            });
+            seq += 1;
+            events.push(PyEvent {
+                beat,
+                value,
+                tag: PyEventTag::DelayEnd,
+                seq,
+            });
+            seq += 1;
+        }
+        for (beat, value) in stops {
+            events.push(PyEvent {
+                beat,
+                value,
+                tag: PyEventTag::Stop,
+                seq,
+            });
+            seq += 1;
+            events.push(PyEvent {
+                beat,
+                value,
+                tag: PyEventTag::StopEnd,
+                seq,
+            });
+            seq += 1;
+        }
+        for (start, end) in warp_ranges {
+            events.push(PyEvent {
+                beat: start,
+                value: 0.0,
+                tag: PyEventTag::Warp,
+                seq,
+            });
+            seq += 1;
+            events.push(PyEvent {
+                beat: end,
+                value: 0.0,
+                tag: PyEventTag::WarpEnd,
+                seq,
+            });
+            seq += 1;
+        }
+        events.sort_by(|a, b| {
+            a.beat
+                .total_cmp(&b.beat)
+                .then_with(|| a.tag.cmp(&b.tag))
+                .then_with(|| a.seq.cmp(&b.seq))
+        });
+
+        let mut states = Vec::with_capacity(events.len() + 1);
+        let mut last = PyTimingState {
+            beat: 0.0,
+            value: first_bpm.1,
+            tag: PyEventTag::Bpm,
+            time: -offset_sec,
+            bpm: first_bpm.1,
+            warp: false,
+        };
+        states.push(last);
+
+        for event in events {
+            let dt = py_time_until(last, event.beat, event.tag);
+            let time = last.time + dt;
+            let bpm = if event.tag == PyEventTag::Bpm {
+                event.value
+            } else {
+                last.bpm
+            };
+            let warp = match event.tag {
+                PyEventTag::Warp => true,
+                PyEventTag::WarpEnd => false,
+                _ => last.warp,
+            };
+            last = PyTimingState {
+                beat: event.beat,
+                value: event.value,
+                tag: event.tag,
+                time,
+                bpm,
+                warp,
+            };
+            states.push(last);
+        }
+
+        Ok(Self { states })
+    }
+
+    fn time_at_stop(&self, beat: f64) -> f64 {
+        let idx = bisect_tagged_beats(&self.states, beat, PyEventTag::Stop).saturating_sub(1);
+        let prior = self.states[idx];
+        prior.time + py_time_until(prior, beat, PyEventTag::Stop)
+    }
+}
+
+fn parse_beat_values(raw: &str) -> Vec<(f64, f64)> {
+    raw.trim()
+        .split(',')
+        .filter_map(|part| {
+            let (beat_s, value_s) = part.trim().split_once('=')?;
+            let beat = beat_s.trim().parse::<f64>().ok()?;
+            let value = value_s.trim().parse::<f64>().ok()?;
+            (beat.is_finite() && value.is_finite()).then_some((beat, value))
+        })
+        .collect()
+}
+
+fn coalesce_warps(warps: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let mut out = Vec::new();
+    for (beat, value) in warps {
+        let end = beat + value;
+        if let Some((_, last_end)) = out.last_mut() {
+            if *beat <= *last_end {
+                if end > *last_end {
+                    *last_end = end;
+                }
+                continue;
+            }
+        }
+        out.push((*beat, end));
+    }
+    out
+}
+
+fn bisect_tagged_beats(states: &[PyTimingState], beat: f64, tag: PyEventTag) -> usize {
+    let mut lo = 0usize;
+    let mut hi = states.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let s = states[mid];
+        if s.beat < beat || (s.beat == beat && s.tag <= tag) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+fn py_time_until(state: PyTimingState, beat: f64, event_tag: PyEventTag) -> f64 {
+    let mut time_until = if state.warp {
+        0.0
+    } else {
+        (beat - state.beat) * 60.0 / state.bpm
+    };
+    let from_pause = matches!(state.tag, PyEventTag::Stop | PyEventTag::Delay);
+    let to_end = matches!(event_tag, PyEventTag::StopEnd | PyEventTag::DelayEnd);
+    if from_pause && to_end {
+        time_until += state.value;
+    }
+    time_until
 }
 
 fn parse_kernel_target(raw: &str) -> Result<KernelTarget, String> {
