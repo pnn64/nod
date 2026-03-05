@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::audio::probe_ogg_mono_like_python;
 use crate::cli::ParityCmd;
 use crate::fs_scan::{baseline_rel_for_md5, discover_simfiles, md5_hex, rel_path};
 use crate::model::{ParityCase, ParityReport};
@@ -35,10 +36,10 @@ fn check_one(path: &Path, root: &Path, baseline_root: &Path) -> ParityCase {
     let baseline_rel = baseline_rel_for_md5(&digest);
     let (candidate_json, candidate_zst) = baseline_candidates(baseline_root, &digest);
     if candidate_json.exists() {
-        return load_baseline_file(&candidate_json, &simfile_rel, &digest, &baseline_rel);
+        return load_baseline_file(&candidate_json, path, &simfile_rel, &digest, &baseline_rel);
     }
     if candidate_zst.exists() {
-        return load_baseline_file(&candidate_zst, &simfile_rel, &digest, &baseline_rel);
+        return load_baseline_file(&candidate_zst, path, &simfile_rel, &digest, &baseline_rel);
     }
     ParityCase {
         simfile_rel,
@@ -59,12 +60,16 @@ fn baseline_candidates(root: &Path, md5: &str) -> (PathBuf, PathBuf) {
 }
 
 fn load_baseline_file(
-    path: &Path,
+    baseline_path: &Path,
+    simfile_path: &Path,
     simfile_rel: &str,
     digest: &str,
     baseline_rel: &str,
 ) -> ParityCase {
-    match read_baseline(path).and_then(parse_baseline) {
+    match read_baseline(baseline_path)
+        .and_then(parse_baseline)
+        .and_then(|baseline| validate_baseline_audio(simfile_path, &baseline))
+    {
         Ok(()) => ParityCase {
             simfile_rel: simfile_rel.to_string(),
             simfile_md5: digest.to_string(),
@@ -97,10 +102,89 @@ fn read_baseline(path: &Path) -> Result<Vec<u8>, String> {
     }
 }
 
-fn parse_baseline(bytes: Vec<u8>) -> Result<(), String> {
+fn parse_baseline(bytes: Vec<u8>) -> Result<BaselineFixture, String> {
     serde_json::from_slice::<BaselineFixture>(&bytes)
-        .map(|_| ())
         .map_err(|e| format!("baseline json parse failed: {e}"))
+}
+
+fn validate_baseline_audio(simfile_path: &Path, baseline: &BaselineFixture) -> Result<(), String> {
+    let song_dir = simfile_path.parent().ok_or_else(|| {
+        format!(
+            "simfile has no parent directory: {}",
+            simfile_path.display()
+        )
+    })?;
+    let mut cache = Vec::new();
+    for row in &baseline.charts {
+        let Some(music_tag) = chart_music_tag(row, &baseline.music) else {
+            continue;
+        };
+        let Some(audio_path) = rssp::assets::resolve_music_path_like_itg(song_dir, music_tag)
+        else {
+            return Err(format!(
+                "{} unresolved #MUSIC {:?}",
+                chart_label(row),
+                music_tag
+            ));
+        };
+        probe_ogg_cached(&audio_path, &mut cache)
+            .map_err(|e| format!("{} audio probe failed: {e}", chart_label(row)))?;
+    }
+    Ok(())
+}
+
+fn chart_music_tag<'a>(row: &'a BaselineChart, root_music: &'a str) -> Option<&'a str> {
+    row.music
+        .as_deref()
+        .and_then(non_empty_trim)
+        .or_else(|| non_empty_trim(root_music))
+}
+
+fn non_empty_trim(s: &str) -> Option<&str> {
+    let t = s.trim();
+    if t.is_empty() { None } else { Some(t) }
+}
+
+fn chart_label(row: &BaselineChart) -> String {
+    row.chart_index
+        .map_or_else(|| "chart[base]".to_string(), |i| format!("chart[{i}]"))
+}
+
+fn probe_ogg_cached(path: &Path, cache: &mut Vec<AudioCacheEntry>) -> Result<(), String> {
+    let mut probe = |p: &Path| -> Result<(), String> {
+        if !is_ogg_path(p) {
+            return Err(format!("unsupported audio format at {}", p.display()));
+        }
+        probe_ogg_mono_like_python(p).map(|_| ())
+    };
+    probe_cached_with(path, cache, &mut probe)
+}
+
+fn probe_cached_with<F>(
+    path: &Path,
+    cache: &mut Vec<AudioCacheEntry>,
+    probe_fn: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(&Path) -> Result<(), String>,
+{
+    for entry in cache.iter() {
+        if entry.path == path {
+            return entry.result.clone();
+        }
+    }
+    let result = probe_fn(path);
+    cache.push(AudioCacheEntry {
+        path: path.to_path_buf(),
+        result: result.clone(),
+    });
+    result
+}
+
+fn is_ogg_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("ogg"))
 }
 
 fn build_report(root: &Path, baseline: &Path, cases: Vec<ParityCase>) -> ParityReport {
@@ -128,14 +212,14 @@ fn count_status(cases: &[ParityCase], status: &str) -> usize {
     cases.iter().filter(|c| c.status == status).count()
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct BaselineFixture {
+    #[serde(default)]
+    music: String,
     #[serde(default)]
     charts: Vec<BaselineChart>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct BaselineChart {
     #[serde(default)]
@@ -144,17 +228,24 @@ struct BaselineChart {
     music: Option<String>,
 }
 
+#[derive(Clone)]
+struct AudioCacheEntry {
+    path: PathBuf,
+    result: Result<(), String>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
     use std::fs;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::cli::ParityCmd;
     use crate::fs_scan::md5_hex;
 
-    use super::run;
+    use super::{BaselineChart, chart_music_tag, probe_cached_with, run};
 
     #[test]
     fn parity_matches_existing_baseline_file() {
@@ -208,6 +299,39 @@ mod tests {
         assert_eq!(report.matched, 0);
         assert_eq!(report.missing_baseline, 1);
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn chart_music_prefers_row_override_then_root() {
+        let row_with = BaselineChart {
+            chart_index: Some(2),
+            music: Some("split.ogg".to_string()),
+        };
+        let row_without = BaselineChart {
+            chart_index: Some(3),
+            music: None,
+        };
+        assert_eq!(chart_music_tag(&row_with, "base.ogg"), Some("split.ogg"));
+        assert_eq!(chart_music_tag(&row_without, "base.ogg"), Some("base.ogg"));
+        assert_eq!(chart_music_tag(&row_without, "   "), None);
+    }
+
+    #[test]
+    fn probe_cache_hits_same_path_once() {
+        let mut cache = Vec::new();
+        let mut calls = 0usize;
+        let mut fake = |_: &Path| -> Result<(), String> {
+            calls += 1;
+            Ok(())
+        };
+        let p = Path::new("/tmp/same.ogg");
+        let r1 = probe_cached_with(p, &mut cache, &mut fake);
+        let r2 = probe_cached_with(p, &mut cache, &mut fake);
+        let r3 = probe_cached_with(Path::new("/tmp/other.ogg"), &mut cache, &mut fake);
+        assert!(r1.is_ok());
+        assert!(r2.is_ok());
+        assert!(r3.is_ok());
+        assert_eq!(calls, 2);
     }
 
     fn temp_root(tag: &str) -> PathBuf {
