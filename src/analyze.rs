@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 
 use rssp::{AnalysisOptions, analyze};
 
-use crate::audio::{decode_ogg_mono_like_python, duration_seconds, peak_abs};
+use crate::audio::{OggDecode, decode_ogg_mono_like_python, duration_seconds, peak_abs};
+use crate::bias::{BiasCfg, estimate_bias};
 use crate::cli::AnalyzeCmd;
+use crate::compat::guess_paradigm;
 use crate::compat::slot_abbreviation;
 use crate::fs_scan::{discover_simfiles, md5_hex, rel_path};
 use crate::model::{
@@ -16,10 +18,11 @@ pub fn run(args: &AnalyzeCmd) -> Result<AnalyzeReport, String> {
     fs::create_dir_all(&report_path)
         .map_err(|e| format!("create report dir {} failed: {e}", report_path.display()))?;
     let params = build_params(args, &report_path)?;
+    let bias_cfg = bias_cfg_from_params(&params);
     let simfiles = discover_simfiles(&args.root_path)?;
     let scanned = simfiles
         .iter()
-        .map(|path| scan_one(path, &args.root_path))
+        .map(|path| scan_one(path, &args.root_path, &params, &bias_cfg))
         .collect::<Vec<_>>();
     Ok(AnalyzeReport {
         tool: "rnon".to_string(),
@@ -92,7 +95,7 @@ fn resolve_report_path(root: &Path, explicit: Option<&Path>) -> Result<PathBuf, 
     }
 }
 
-fn scan_one(path: &Path, root: &Path) -> SimfileScan {
+fn scan_one(path: &Path, root: &Path, params: &AnalyzeParams, bias_cfg: &BiasCfg) -> SimfileScan {
     let rel = rel_path(root, path);
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -103,7 +106,15 @@ fn scan_one(path: &Path, root: &Path) -> SimfileScan {
     let options = AnalysisOptions::default();
     match analyze(&bytes, &ext, &options) {
         Ok(summary) => {
-            let audio = probe_audio(path, &summary.music_path);
+            let audio_probe = probe_audio(path, &summary.music_path);
+            let mut chart_scans = charts_from_summary(&summary.charts);
+            apply_bias_estimates(
+                &summary.charts,
+                &mut chart_scans,
+                audio_probe.decoded.as_ref(),
+                params,
+                bias_cfg,
+            );
             SimfileScan {
                 simfile_path: path.display().to_string(),
                 simfile_rel: rel,
@@ -116,8 +127,8 @@ fn scan_one(path: &Path, root: &Path) -> SimfileScan {
                 artist: Some(summary.artist_str),
                 offset_seconds: Some(summary.offset),
                 music_tag: Some(summary.music_path),
-                audio,
-                charts: charts_from_summary(&summary.charts),
+                audio: audio_probe.scan,
+                charts: chart_scans,
             }
         }
         Err(err) => SimfileScan {
@@ -153,6 +164,9 @@ fn charts_from_summary(charts: &[rssp::ChartSummary]) -> Vec<ChartScan> {
             status: "stub".to_string(),
             bias_ms: None,
             confidence: None,
+            conv_quint: None,
+            conv_stdev: None,
+            paradigm: None,
         })
         .collect()
 }
@@ -181,54 +195,72 @@ fn simfile_ext(path: &Path) -> String {
         .map_or_else(String::new, |s| s.to_ascii_lowercase())
 }
 
-fn probe_audio(simfile_path: &Path, music_tag: &str) -> AudioScan {
+fn probe_audio(simfile_path: &Path, music_tag: &str) -> AudioProbe {
     let Some(song_dir) = simfile_path.parent() else {
-        return audio_unavailable("missing_song_dir", "simfile has no parent directory");
+        return AudioProbe {
+            scan: audio_unavailable("missing_song_dir", "simfile has no parent directory"),
+            decoded: None,
+        };
     };
     let Some(audio_path) = rssp::assets::resolve_music_path_like_itg(song_dir, music_tag) else {
-        return AudioScan {
-            status: "missing".to_string(),
-            path: None,
-            sample_rate_hz: None,
-            source_channels: None,
-            mono_samples: None,
-            duration_seconds: None,
-            peak_abs: None,
-            error: Some("no OGG file resolved for #MUSIC".to_string()),
+        return AudioProbe {
+            scan: AudioScan {
+                status: "missing".to_string(),
+                path: None,
+                sample_rate_hz: None,
+                source_channels: None,
+                mono_samples: None,
+                duration_seconds: None,
+                peak_abs: None,
+                error: Some("no OGG file resolved for #MUSIC".to_string()),
+            },
+            decoded: None,
         };
     };
     if !is_ogg_path(&audio_path) {
-        return AudioScan {
-            status: "unsupported".to_string(),
-            path: Some(audio_path.display().to_string()),
-            sample_rate_hz: None,
-            source_channels: None,
-            mono_samples: None,
-            duration_seconds: None,
-            peak_abs: None,
-            error: Some("only OGG is currently supported".to_string()),
+        return AudioProbe {
+            scan: AudioScan {
+                status: "unsupported".to_string(),
+                path: Some(audio_path.display().to_string()),
+                sample_rate_hz: None,
+                source_channels: None,
+                mono_samples: None,
+                duration_seconds: None,
+                peak_abs: None,
+                error: Some("only OGG is currently supported".to_string()),
+            },
+            decoded: None,
         };
     }
     match decode_ogg_mono_like_python(&audio_path) {
-        Ok(decoded) => AudioScan {
-            status: "decoded".to_string(),
-            path: Some(audio_path.display().to_string()),
-            sample_rate_hz: Some(decoded.sample_rate_hz),
-            source_channels: Some(decoded.source_channels),
-            mono_samples: Some(decoded.mono.len()),
-            duration_seconds: Some(duration_seconds(decoded.mono.len(), decoded.sample_rate_hz)),
-            peak_abs: Some(peak_abs(&decoded.mono)),
-            error: None,
+        Ok(decoded) => AudioProbe {
+            scan: AudioScan {
+                status: "decoded".to_string(),
+                path: Some(audio_path.display().to_string()),
+                sample_rate_hz: Some(decoded.sample_rate_hz),
+                source_channels: Some(decoded.source_channels),
+                mono_samples: Some(decoded.mono.len()),
+                duration_seconds: Some(duration_seconds(
+                    decoded.mono.len(),
+                    decoded.sample_rate_hz,
+                )),
+                peak_abs: Some(peak_abs(&decoded.mono)),
+                error: None,
+            },
+            decoded: Some(decoded),
         },
-        Err(err) => AudioScan {
-            status: "error".to_string(),
-            path: Some(audio_path.display().to_string()),
-            sample_rate_hz: None,
-            source_channels: None,
-            mono_samples: None,
-            duration_seconds: None,
-            peak_abs: None,
-            error: Some(err),
+        Err(err) => AudioProbe {
+            scan: AudioScan {
+                status: "error".to_string(),
+                path: Some(audio_path.display().to_string()),
+                sample_rate_hz: None,
+                source_channels: None,
+                mono_samples: None,
+                duration_seconds: None,
+                peak_abs: None,
+                error: Some(err),
+            },
+            decoded: None,
         },
     }
 }
@@ -250,4 +282,70 @@ fn is_ogg_path(path: &Path) -> bool {
     path.extension()
         .and_then(|s| s.to_str())
         .is_some_and(|s| s.eq_ignore_ascii_case("ogg"))
+}
+
+fn apply_bias_estimates(
+    summary_charts: &[rssp::ChartSummary],
+    chart_scans: &mut [ChartScan],
+    audio: Option<&OggDecode>,
+    params: &AnalyzeParams,
+    bias_cfg: &BiasCfg,
+) {
+    let Some(audio) = audio else {
+        for chart in chart_scans {
+            chart.status = "audio_unavailable".to_string();
+        }
+        return;
+    };
+    for (i, chart) in summary_charts.iter().enumerate() {
+        let result = estimate_bias(&audio.mono, audio.sample_rate_hz, chart, bias_cfg);
+        let scan = &mut chart_scans[i];
+        match result {
+            Ok(est) => {
+                scan.status = "computed".to_string();
+                scan.bias_ms = Some(est.bias_ms);
+                scan.confidence = Some(est.confidence);
+                scan.conv_quint = Some(est.conv_quint);
+                scan.conv_stdev = Some(est.conv_stdev);
+                scan.paradigm = Some(
+                    guess_paradigm(
+                        est.bias_ms,
+                        params.tolerance,
+                        params.consider_null,
+                        params.consider_p9ms,
+                        true,
+                    )
+                    .to_string(),
+                );
+            }
+            Err(err) => {
+                scan.status = "bias_error".to_string();
+                scan.paradigm = Some("????".to_string());
+                scan.conv_quint = None;
+                scan.conv_stdev = None;
+                scan.bias_ms = None;
+                scan.confidence = None;
+                if scan.description.is_empty() {
+                    scan.description = format!("[bias_error: {err}]");
+                }
+            }
+        }
+    }
+}
+
+fn bias_cfg_from_params(params: &AnalyzeParams) -> BiasCfg {
+    BiasCfg {
+        fingerprint_ms: params.fingerprint_ms,
+        window_ms: params.window_ms,
+        step_ms: params.step_ms,
+        magic_offset_ms: params.magic_offset_ms,
+        kernel_target: params.kernel_target,
+        kernel_type: params.kernel_type,
+        _full_spectrogram: params.full_spectrogram,
+    }
+}
+
+struct AudioProbe {
+    scan: AudioScan,
+    decoded: Option<OggDecode>,
 }

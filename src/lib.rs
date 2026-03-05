@@ -1,5 +1,6 @@
 mod analyze;
 mod audio;
+mod bias;
 mod cli;
 mod compat;
 mod fs_scan;

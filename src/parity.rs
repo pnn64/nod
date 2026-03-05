@@ -6,10 +6,16 @@ use std::path::{Path, PathBuf};
 use rssp::{AnalysisOptions, analyze};
 use serde::Deserialize;
 
+use crate::audio::decode_ogg_mono_like_python;
+use crate::bias::{BiasCfg, estimate_bias};
 use crate::cli::ParityCmd;
-use crate::compat::slot_abbreviation;
+use crate::compat::{guess_paradigm, slot_abbreviation};
 use crate::fs_scan::{baseline_rel_for_md5, discover_simfiles, md5_hex, rel_path};
-use crate::model::{ParityCase, ParityReport};
+use crate::model::{BiasKernel, KernelTarget, ParityCase, ParityReport};
+
+const BIAS_MS_TOLERANCE: f64 = 0.25;
+const CONFIDENCE_TOLERANCE: f64 = 1e-3;
+const CONV_TOLERANCE: f64 = 1e-3;
 
 pub fn run(args: &ParityCmd) -> Result<ParityReport, String> {
     let simfiles = discover_simfiles(&args.root_path)?;
@@ -73,7 +79,8 @@ fn check_one(path: &Path, root: &Path, baseline_root: &Path) -> ParityCase {
         }
     };
 
-    let mismatches = compare_fixture(&baseline, &summary);
+    let bias_rows = compute_expected_bias_rows(path, &summary, &baseline);
+    let mismatches = compare_fixture(&baseline, &summary, &bias_rows);
     let mismatch_count = mismatches.len();
     let status = if mismatch_count == 0 {
         "matched"
@@ -131,7 +138,11 @@ fn parse_baseline(bytes: Vec<u8>) -> Result<BaselineFixture, String> {
         .map_err(|e| format!("baseline json parse failed: {e}"))
 }
 
-fn compare_fixture(baseline: &BaselineFixture, summary: &rssp::SimfileSummary) -> Vec<String> {
+fn compare_fixture(
+    baseline: &BaselineFixture,
+    summary: &rssp::SimfileSummary,
+    bias_rows: &BiasRows,
+) -> Vec<String> {
     let mut mismatches = Vec::new();
     compare_text(
         "title",
@@ -164,13 +175,19 @@ fn compare_fixture(baseline: &BaselineFixture, summary: &rssp::SimfileSummary) -
         1e-6,
         &mut mismatches,
     );
-    compare_chart_rows(&baseline.charts, &expected_charts(summary), &mut mismatches);
+    compare_chart_rows(
+        &baseline.charts,
+        &expected_charts(summary),
+        bias_rows,
+        &mut mismatches,
+    );
     mismatches
 }
 
 fn compare_chart_rows(
     baseline_rows: &[BaselineChart],
     expected_rows: &[ExpectedChart],
+    bias_rows: &BiasRows,
     mismatches: &mut Vec<String>,
 ) {
     if baseline_rows.len() != expected_rows.len() {
@@ -191,7 +208,7 @@ fn compare_chart_rows(
             ));
             continue;
         };
-        compare_chart_row(*chart_index, baseline, expected, mismatches);
+        compare_chart_row(*chart_index, baseline, expected, bias_rows, mismatches);
     }
 
     for chart_index in base_map.keys() {
@@ -239,6 +256,7 @@ fn compare_chart_row(
     chart_index: Option<usize>,
     baseline: &BaselineChart,
     expected: &ExpectedChart,
+    bias_rows: &BiasRows,
     mismatches: &mut Vec<String>,
 ) {
     if baseline.slot_null != expected.slot_null {
@@ -283,6 +301,7 @@ fn compare_chart_row(
             baseline.chart_has_own_timing, expected.chart_has_own_timing
         ));
     }
+    compare_chart_bias(chart_index, baseline, bias_rows, mismatches);
 }
 
 fn expected_charts(summary: &rssp::SimfileSummary) -> Vec<ExpectedChart> {
@@ -371,6 +390,249 @@ fn compare_float_opt(
     }
 }
 
+fn compare_chart_bias(
+    chart_index: Option<usize>,
+    baseline: &BaselineChart,
+    bias_rows: &BiasRows,
+    mismatches: &mut Vec<String>,
+) {
+    if !has_bias_fields(baseline) {
+        return;
+    }
+    if let Some(err) = bias_rows.errors.get(&chart_index) {
+        mismatches.push(format!(
+            "chart[{chart_index:?}] bias estimation failed: {err}"
+        ));
+        return;
+    }
+    let Some(expected) = bias_rows.values.get(&chart_index) else {
+        mismatches.push(format!(
+            "chart[{chart_index:?}] missing expected bias estimate"
+        ));
+        return;
+    };
+    compare_float_if_present(
+        &format!("chart[{chart_index:?}].bias_ms"),
+        baseline.bias_ms,
+        expected.bias_ms,
+        BIAS_MS_TOLERANCE,
+        mismatches,
+    );
+    compare_float_if_present(
+        &format!("chart[{chart_index:?}].confidence"),
+        baseline.confidence,
+        expected.confidence,
+        CONFIDENCE_TOLERANCE,
+        mismatches,
+    );
+    compare_float_if_present(
+        &format!("chart[{chart_index:?}].conv_quint"),
+        baseline.conv_quint,
+        expected.conv_quint,
+        CONV_TOLERANCE,
+        mismatches,
+    );
+    compare_float_if_present(
+        &format!("chart[{chart_index:?}].conv_stdev"),
+        baseline.conv_stdev,
+        expected.conv_stdev,
+        CONV_TOLERANCE,
+        mismatches,
+    );
+    if let Some(base) = normalize_opt_text(baseline.paradigm.as_deref()) {
+        let exp = normalize_opt_text(Some(expected.paradigm.as_str()));
+        if Some(base) != exp {
+            mismatches.push(format!(
+                "chart[{chart_index:?}].paradigm mismatch: baseline={:?} expected={:?}",
+                Some(base),
+                exp
+            ));
+        }
+    }
+}
+
+fn compare_float_if_present(
+    field: &str,
+    baseline: Option<f64>,
+    expected: f64,
+    tolerance: f64,
+    mismatches: &mut Vec<String>,
+) {
+    let Some(base) = baseline else {
+        return;
+    };
+    if (base - expected).abs() > tolerance {
+        mismatches.push(format!(
+            "{field} mismatch: baseline={base:.6} expected={expected:.6} tolerance={tolerance:.6}"
+        ));
+    }
+}
+
+fn has_bias_fields(row: &BaselineChart) -> bool {
+    row.bias_ms.is_some()
+        || row.confidence.is_some()
+        || row.conv_quint.is_some()
+        || row.conv_stdev.is_some()
+        || normalize_opt_text(row.paradigm.as_deref()).is_some()
+}
+
+fn compute_expected_bias_rows(
+    simfile_path: &Path,
+    summary: &rssp::SimfileSummary,
+    baseline: &BaselineFixture,
+) -> BiasRows {
+    let mut out = BiasRows::default();
+    let requested = baseline
+        .charts
+        .iter()
+        .filter(|row| has_bias_fields(row))
+        .map(|row| row.chart_index)
+        .collect::<Vec<_>>();
+    if requested.is_empty() {
+        return out;
+    }
+    let Some(song_dir) = simfile_path.parent() else {
+        assign_bias_error(
+            &mut out.errors,
+            &requested,
+            "simfile has no parent directory",
+        );
+        return out;
+    };
+    let Some(audio_path) = rssp::assets::resolve_music_path_like_itg(song_dir, &summary.music_path)
+    else {
+        assign_bias_error(
+            &mut out.errors,
+            &requested,
+            "could not resolve #MUSIC audio path",
+        );
+        return out;
+    };
+    if !is_ogg_path(&audio_path) {
+        assign_bias_error(
+            &mut out.errors,
+            &requested,
+            "only OGG audio is currently supported for parity bias checks",
+        );
+        return out;
+    }
+    let decoded = match decode_ogg_mono_like_python(&audio_path) {
+        Ok(decoded) => decoded,
+        Err(err) => {
+            assign_bias_error(
+                &mut out.errors,
+                &requested,
+                &format!("audio decode failed: {err}"),
+            );
+            return out;
+        }
+    };
+    let cfg = match bias_cfg_from_baseline_params(&baseline.params) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            assign_bias_error(
+                &mut out.errors,
+                &requested,
+                &format!("invalid baseline params: {err}"),
+            );
+            return out;
+        }
+    };
+    for chart_index in requested {
+        let Some(chart) = chart_for_bias(summary, chart_index) else {
+            out.errors.insert(
+                chart_index,
+                "missing chart in rssp summary for baseline row".to_string(),
+            );
+            continue;
+        };
+        match estimate_bias(&decoded.mono, decoded.sample_rate_hz, chart, &cfg) {
+            Ok(est) => {
+                let paradigm = guess_paradigm(
+                    est.bias_ms,
+                    baseline.params.tolerance,
+                    baseline.params.consider_null,
+                    baseline.params.consider_p9ms,
+                    true,
+                )
+                .to_string();
+                out.values.insert(
+                    chart_index,
+                    ExpectedBias {
+                        bias_ms: est.bias_ms,
+                        confidence: est.confidence,
+                        conv_quint: est.conv_quint,
+                        conv_stdev: est.conv_stdev,
+                        paradigm,
+                    },
+                );
+            }
+            Err(err) => {
+                out.errors.insert(chart_index, err);
+            }
+        }
+    }
+    out
+}
+
+fn assign_bias_error(
+    errors: &mut BTreeMap<Option<usize>, String>,
+    keys: &[Option<usize>],
+    msg: &str,
+) {
+    for key in keys {
+        errors.insert(*key, msg.to_string());
+    }
+}
+
+fn chart_for_bias(
+    summary: &rssp::SimfileSummary,
+    chart_index: Option<usize>,
+) -> Option<&rssp::ChartSummary> {
+    match chart_index {
+        Some(i) => summary.charts.get(i),
+        None => summary
+            .charts
+            .iter()
+            .find(|chart| !chart.chart_has_own_timing)
+            .or_else(|| summary.charts.first()),
+    }
+}
+
+fn is_ogg_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("ogg"))
+}
+
+fn bias_cfg_from_baseline_params(params: &BaselineParams) -> Result<BiasCfg, String> {
+    Ok(BiasCfg {
+        fingerprint_ms: params.fingerprint_ms,
+        window_ms: params.window_ms,
+        step_ms: params.step_ms,
+        magic_offset_ms: params.magic_offset_ms,
+        kernel_target: parse_kernel_target(&params.kernel_target)?,
+        kernel_type: parse_kernel_type(&params.kernel_type)?,
+        _full_spectrogram: params.full_spectrogram,
+    })
+}
+
+fn parse_kernel_target(raw: &str) -> Result<KernelTarget, String> {
+    match raw.to_ascii_lowercase().as_str() {
+        "0" | "digest" => Ok(KernelTarget::Digest),
+        "1" | "acc" | "accumulator" => Ok(KernelTarget::Accumulator),
+        _ => Err(format!("invalid kernel target: {raw}")),
+    }
+}
+
+fn parse_kernel_type(raw: &str) -> Result<BiasKernel, String> {
+    match raw.to_ascii_lowercase().as_str() {
+        "0" | "rising" => Ok(BiasKernel::Rising),
+        "1" | "loudest" => Ok(BiasKernel::Loudest),
+        _ => Err(format!("invalid kernel type: {raw}")),
+    }
+}
+
 fn case_read_error(simfile_rel: String, err: String) -> ParityCase {
     ParityCase {
         simfile_rel,
@@ -394,7 +656,7 @@ fn build_report(root: &Path, baseline: &Path, cases: Vec<ParityCase>) -> ParityR
     ParityReport {
         tool: "rnon".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        mode: "structural-parity".to_string(),
+        mode: "parity".to_string(),
         root_path: root.display().to_string(),
         baseline_path: baseline.display().to_string(),
         total_simfiles: total,
@@ -430,7 +692,50 @@ struct BaselineFixture {
     music: String,
     offset: Option<f64>,
     #[serde(default)]
+    params: BaselineParams,
+    #[serde(default)]
     charts: Vec<BaselineChart>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BaselineParams {
+    #[serde(default = "default_true")]
+    consider_null: bool,
+    #[serde(default = "default_true")]
+    consider_p9ms: bool,
+    #[serde(default = "default_fingerprint_ms")]
+    fingerprint_ms: f64,
+    #[serde(default)]
+    full_spectrogram: bool,
+    #[serde(default = "default_kernel_target")]
+    kernel_target: String,
+    #[serde(default = "default_kernel_type")]
+    kernel_type: String,
+    #[serde(default)]
+    magic_offset_ms: f64,
+    #[serde(default = "default_step_ms")]
+    step_ms: f64,
+    #[serde(default = "default_tolerance")]
+    tolerance: f64,
+    #[serde(default = "default_window_ms")]
+    window_ms: f64,
+}
+
+impl Default for BaselineParams {
+    fn default() -> Self {
+        Self {
+            consider_null: true,
+            consider_p9ms: true,
+            fingerprint_ms: default_fingerprint_ms(),
+            full_spectrogram: false,
+            kernel_target: default_kernel_target(),
+            kernel_type: default_kernel_type(),
+            magic_offset_ms: 0.0,
+            step_ms: default_step_ms(),
+            tolerance: default_tolerance(),
+            window_ms: default_window_ms(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -450,6 +755,16 @@ struct BaselineChart {
     description: Option<String>,
     #[serde(default)]
     chart_has_own_timing: bool,
+    #[serde(default)]
+    bias_ms: Option<f64>,
+    #[serde(default)]
+    confidence: Option<f64>,
+    #[serde(default)]
+    conv_quint: Option<f64>,
+    #[serde(default)]
+    conv_stdev: Option<f64>,
+    #[serde(default)]
+    paradigm: Option<String>,
 }
 
 #[derive(Debug)]
@@ -461,6 +776,49 @@ struct ExpectedChart {
     difficulty: Option<String>,
     description: Option<String>,
     chart_has_own_timing: bool,
+}
+
+#[derive(Debug)]
+struct ExpectedBias {
+    bias_ms: f64,
+    confidence: f64,
+    conv_quint: f64,
+    conv_stdev: f64,
+    paradigm: String,
+}
+
+#[derive(Debug, Default)]
+struct BiasRows {
+    values: BTreeMap<Option<usize>, ExpectedBias>,
+    errors: BTreeMap<Option<usize>, String>,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_fingerprint_ms() -> f64 {
+    50.0
+}
+
+const fn default_step_ms() -> f64 {
+    0.2
+}
+
+const fn default_window_ms() -> f64 {
+    10.0
+}
+
+const fn default_tolerance() -> f64 {
+    4.0
+}
+
+fn default_kernel_target() -> String {
+    "digest".to_string()
+}
+
+fn default_kernel_type() -> String {
+    "rising".to_string()
 }
 
 #[cfg(test)]
