@@ -4,54 +4,80 @@ use std::path::Path;
 
 use lewton::inside_ogg::OggStreamReader;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OggProbe {
+const PCM_SCALE: f32 = 32768.0;
+
+#[derive(Debug, Clone)]
+pub struct OggDecode {
     pub sample_rate_hz: u32,
-    pub source_channels: u16,
-    pub mono_samples: usize,
+    pub mono: Vec<f32>,
 }
 
-pub fn probe_ogg_mono_like_python(path: &Path) -> Result<OggProbe, String> {
+pub fn decode_ogg_mono_like_python(path: &Path) -> Result<OggDecode, String> {
     let file = File::open(path).map_err(|e| format!("open {} failed: {e}", path.display()))?;
     let mut reader = OggStreamReader::new(BufReader::new(file))
         .map_err(|e| format!("ogg header parse {} failed: {e}", path.display()))?;
     let sample_rate_hz = reader.ident_hdr.audio_sample_rate;
     let source_channels = u16::from(reader.ident_hdr.audio_channels);
-    let mut mono_samples = 0usize;
+    let mut mono = Vec::new();
     while let Some(packet) = reader
         .read_dec_packet_itl()
         .map_err(|e| format!("ogg decode {} failed: {e}", path.display()))?
     {
-        mono_samples += packet_mono_len(&packet, source_channels);
+        append_python_mono_like(&packet, source_channels, &mut mono);
     }
-    Ok(OggProbe {
+    Ok(OggDecode {
         sample_rate_hz,
-        source_channels,
-        mono_samples,
+        mono,
     })
 }
 
-fn packet_mono_len(packet: &[i16], channels: u16) -> usize {
+fn append_python_mono_like(packet: &[i16], channels: u16, out: &mut Vec<f32>) {
     if channels == 2 {
-        packet.len() / 2
+        append_stereo_max(packet, out);
     } else {
-        packet.len()
+        append_passthrough(packet, out);
+    }
+}
+
+fn append_stereo_max(packet: &[i16], out: &mut Vec<f32>) {
+    out.reserve(packet.len() / 2);
+    let mut i = 0usize;
+    while i + 1 < packet.len() {
+        let l = packet[i];
+        let r = packet[i + 1];
+        let s = if l > r { l } else { r };
+        out.push(f32::from(s) / PCM_SCALE);
+        i += 2;
+    }
+}
+
+fn append_passthrough(packet: &[i16], out: &mut Vec<f32>) {
+    out.reserve(packet.len());
+    for s in packet {
+        out.push(f32::from(*s) / PCM_SCALE);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::packet_mono_len;
+    use super::append_python_mono_like;
 
     #[test]
-    fn stereo_packets_count_half_frames() {
-        let packet = [1_i16, 2, 3, 4, 5, 6];
-        assert_eq!(packet_mono_len(&packet, 2), 3);
+    fn stereo_collapse_uses_channel_max() {
+        let mut out = Vec::new();
+        append_python_mono_like(&[100, 200, -3200, -6400], 2, &mut out);
+        assert_eq!(out.len(), 2);
+        assert!((out[0] - (200.0 / 32768.0)).abs() < 1e-7);
+        assert!((out[1] - (-3200.0 / 32768.0)).abs() < 1e-7);
     }
 
     #[test]
-    fn mono_packets_count_all_samples() {
-        let packet = [1_i16, 2, 3, 4];
-        assert_eq!(packet_mono_len(&packet, 1), 4);
+    fn mono_passthrough_is_normalized() {
+        let mut out = Vec::new();
+        append_python_mono_like(&[32767, 0, -32768], 1, &mut out);
+        assert_eq!(out.len(), 3);
+        assert!((out[0] - (32767.0 / 32768.0)).abs() < 1e-7);
+        assert_eq!(out[1], 0.0);
+        assert_eq!(out[2], -1.0);
     }
 }
