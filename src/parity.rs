@@ -155,12 +155,7 @@ fn compare_row(
     if !row_needs_audio(row) {
         return Ok(());
     }
-    let Some(music_tag) = chart_music_tag(
-        row,
-        &baseline.music,
-        None,
-        &summary.music_path,
-    ) else {
+    let Some(music_tag) = chart_music_tag(row, &baseline.music, None, &summary.music_path) else {
         mismatches.push(format!("{} missing music tag", chart_label(row)));
         return Ok(());
     };

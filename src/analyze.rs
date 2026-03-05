@@ -317,16 +317,30 @@ fn write_bias(
     scan.confidence = Some(confidence);
     scan.conv_quint = Some(conv_quint);
     scan.conv_stdev = Some(conv_stdev);
-    scan.paradigm = Some(
-        guess_paradigm(
-            bias_ms,
-            params.tolerance,
-            params.consider_null,
-            params.consider_p9ms,
-            true,
-        )
-        .to_string(),
-    );
+    scan.paradigm = Some(resolve_paradigm(bias_ms, confidence, params));
+}
+
+fn resolve_paradigm(bias_ms: f64, confidence: f64, params: &AnalyzeParams) -> String {
+    if confidence < params.confidence_limit {
+        return "????".to_string();
+    }
+    let (consider_null, consider_p9ms) = target_paradigm_flags(params);
+    guess_paradigm(
+        bias_ms,
+        params.tolerance,
+        consider_null,
+        consider_p9ms,
+        true,
+    )
+    .to_string()
+}
+
+fn target_paradigm_flags(params: &AnalyzeParams) -> (bool, bool) {
+    match params.to_paradigm.as_deref() {
+        Some("null") => (true, false),
+        Some("+9ms") => (false, true),
+        _ => (params.consider_null, params.consider_p9ms),
+    }
 }
 
 fn write_bias_error(scan: &mut ChartScan, err: &str) {
@@ -351,7 +365,27 @@ fn is_ogg_path(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::choose_music_tag;
+    use super::{choose_music_tag, resolve_paradigm};
+    use crate::model::{AnalyzeParams, BiasKernel, KernelTarget};
+
+    fn test_params() -> AnalyzeParams {
+        AnalyzeParams {
+            root_path: ".".to_string(),
+            report_path: ".".to_string(),
+            consider_null: true,
+            consider_p9ms: true,
+            tolerance: 4.0,
+            confidence_limit: 0.8,
+            fingerprint_ms: 50.0,
+            window_ms: 10.0,
+            step_ms: 0.2,
+            magic_offset_ms: 0.0,
+            kernel_target: KernelTarget::Digest,
+            kernel_type: BiasKernel::Rising,
+            full_spectrogram: false,
+            to_paradigm: None,
+        }
+    }
 
     #[test]
     fn choose_music_prefers_chart_value() {
@@ -364,5 +398,24 @@ mod tests {
     #[test]
     fn choose_music_falls_back_to_root() {
         assert_eq!(choose_music_tag(None, "base.ogg"), "base.ogg".to_string());
+    }
+
+    #[test]
+    fn resolve_paradigm_applies_confidence_limit() {
+        let params = test_params();
+        assert_eq!(resolve_paradigm(0.1, 0.79, &params), "????".to_string());
+        assert_eq!(resolve_paradigm(0.1, 0.80, &params), "null".to_string());
+    }
+
+    #[test]
+    fn resolve_paradigm_respects_to_paradigm_target() {
+        let mut params = test_params();
+        params.to_paradigm = Some("null".to_string());
+        assert_eq!(resolve_paradigm(8.9, 0.95, &params), "????".to_string());
+        assert_eq!(resolve_paradigm(0.1, 0.95, &params), "null".to_string());
+
+        params.to_paradigm = Some("+9ms".to_string());
+        assert_eq!(resolve_paradigm(0.1, 0.95, &params), "????".to_string());
+        assert_eq!(resolve_paradigm(8.9, 0.95, &params), "+9ms".to_string());
     }
 }
